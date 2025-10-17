@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 
 # =============== CONFIGURACIÓN ===============
-MODE = "BACKTEST"  # "BACKTEST" o "LIVE"  <<< CAMBIAR A "LIVE" PARA PAPER TRADING
+MODE = "LIVE"  # "BACKTEST" o "LIVE"  <<< CAMBIAR A "LIVE" PARA PAPER TRADING
 MODE_N = MODE.strip().upper()
 IS_BACKTEST = (MODE_N == "BACKTEST")
 IS_LIVE = (MODE_N == "LIVE")
@@ -39,6 +39,9 @@ PROCESS_NOISE      = 0.01
 ATR_PERIOD         = 1
 ATR_FACTOR         = 0.4
 TIMEFRAME          = '4 hours'  # timeframe para señales
+
+# Benchmark para ranking por fuerza relativa (RS20)
+RS_BENCHMARK     = 'SPY'
 
 # Backtest
 BT_DURATION_STR = '12 M'
@@ -92,6 +95,32 @@ conn.commit()
 ib = IB()
 ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
 print(f"Conectado a IBKR | MODE={MODE}")
+# =============== RECONEXIÓN Y HORARIO DE MERCADO ===============
+import pytz
+
+def ensure_ib_connection():
+    """Reintenta conexión si IBKR se desconectó."""
+    global ib
+    if ib is None or not ib.isConnected():
+        print("[LIVE][WARN] Desconectado de IBKR, intentando reconectar...")
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        try:
+            ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
+            print("[LIVE] Reconexión exitosa.")
+        except Exception as e:
+            print(f"[LIVE][ERROR] Fallo al reconectar: {e}")
+            time.sleep(30)  # espera antes de reintentar
+
+def market_is_open() -> bool:
+    """True si el mercado USA (NYSE/NASDAQ) está abierto ahora (9:30–16:00 EST)."""
+    from datetime import datetime, time
+    now = datetime.now(pytz.timezone("US/Eastern"))
+    open_t, close_t = time(9, 30), time(16, 0)
+    return open_t <= now.time() <= close_t
+
 
 # =============== UTILIDADES INDICADORES ===============
 def f_kalman_streaming(prices, measurement_noise=1.0, process_noise=0.01):
@@ -200,6 +229,54 @@ def fetch_history(symbol, durationStr, barSize='1 hour', useRTH=True):
     return df
 
 # =============== PERSISTENCIA DE TRADES (BACKTEST) ===============
+# =============== RANKING POR RS20 (mínimo cambio) ===============
+def _rs20(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> float:
+    """
+    Devuelve RS20 = retorno 20 velas del ticker menos retorno 20 velas del benchmark.
+    Si bench_df es None o insuficiente, usa el retorno simple del ticker.
+    """
+    try:
+        if df is None or len(df) < 21:
+            return float("-1e9")
+        r_t = float(df['close'].iloc[-1] / df['close'].iloc[-20] - 1.0)
+        if bench_df is None or len(bench_df) < 21:
+            return r_t
+        r_b = float(bench_df['close'].iloc[-1] / bench_df['close'].iloc[-20] - 1.0)
+        return r_t - r_b
+    except Exception:
+        return float("-1e9")
+
+def rank_candidates_rs20(symbols: list[str], timeframe: str) -> list[str]:
+    """
+    Ordena símbolos por RS20 descendente (benchmark RS_BENCHMARK).
+    No altera tu lógica de señales/entradas/salidas; solo cambia el orden en que se analizan.
+    """
+    bench = None
+    if RS_BENCHMARK:
+        try:
+            bench = fetch_history(RS_BENCHMARK, '2 M', timeframe, True)
+        except Exception as e:
+            print(f"[RANK_RS20] No se pudo cargar benchmark {RS_BENCHMARK}: {e}")
+            bench = None
+
+    scored = []
+    for sym in symbols:
+        try:
+            df = fetch_history(sym, '2 M', timeframe, True)
+            if df is None or df.empty:
+                continue
+            score = _rs20(df, bench)
+            scored.append((sym, score))
+        except Exception as e:
+            print(f"[RANK_RS20][{sym}] {e}")
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    # opcional: print corto de scores
+    if scored:
+        preview = ", ".join([f"{s}:{sc:.3f}" for s, sc in scored[:10]])
+        print(f"[RANK_RS20] Top (preview): {preview}")
+    return [s for s, _ in scored]
+
 def insert_trade_closed(symbol, qty, entry_price, exit_price, entry_dt, exit_dt, comentario):
     pnl = (exit_price - entry_price) * qty
     retorno_pct = (exit_price / entry_price - 1) * 100.0
@@ -535,9 +612,18 @@ if __name__ == '__main__':
             print("----------------------------------------------")
             print(f"TOTAL trades: {total_trades} | Win% global: {win_rate_avg:.1f} | PF mediano: {profit_factor_med:.2f} | PnL total: ${total_pnl:.2f}")
     elif MODE_N == "LIVE":
-        # LIVE
+    # LIVE
         while True:
             print("\n========== NUEVA ITERACIÓN (LIVE) ==========")
+
+            # Intentar reconexión si se cortó IBKR
+            ensure_ib_connection()
+
+            # Si el mercado está cerrado, saltar iteración
+            if not market_is_open():
+                print("[LIVE] Mercado cerrado, esperando próxima ventana (9:30–16:00 EST).")
+                time.sleep(60 * 60)  # duerme 1h antes de revisar de nuevo
+                continue
 
             # 1) Revisar y gestionar PRIMERO los que ya están ABIERTOS en DB
             open_syms = sorted(get_open_symbols_db())
@@ -551,9 +637,12 @@ if __name__ == '__main__':
                     print(f"[LIVE][ERROR exit-check] {sym}: {e}")
 
             # 2) Si hay cupo, buscar ENTRADAS en el resto (excluye los ya abiertos en DB)
+            #    Ordenados por RS20
             if open_trades_count() < MAX_OPEN_TRADES:
-                candidates = [s for s in SYMBOLS if s not in open_syms]
-                for sym in candidates:
+                base = [s for s in SYMBOLS if s not in open_syms]
+                ranked_syms = rank_candidates_rs20(base, TIMEFRAME)
+                print(f"[LIVE][RANK_RS20] Orden de prioridad: {ranked_syms}")
+                for sym in ranked_syms:
                     if open_trades_count() >= MAX_OPEN_TRADES:
                         break
                     try:
@@ -566,3 +655,4 @@ if __name__ == '__main__':
 
             print("\nEsperando próxima revisión (30m)...\n")
             ib.sleep(60 * 30)  # cada 30 minutos
+
