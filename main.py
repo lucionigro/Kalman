@@ -5,61 +5,115 @@ import sqlite3
 import math
 import time
 import os
-from datetime import datetime
+import pytz
+from datetime import datetime, timezone, time as dtime
+from xml.etree import ElementTree as ET
 
-# =============== CONFIGURACIÓN ===============
-MODE = "LIVE"  # "BACKTEST" o "LIVE"  <<< CAMBIAR A "LIVE" PARA PAPER TRADING
+"""
+Main bot con mejoras de ejecución y riesgo para retail:
+- Modos: BACKTEST | LIVE | PREOPEN
+- PREOPEN: analiza última vela diaria cerrada y coloca MOO/LOO para la apertura.
+- LIVE: loop con cierres/entradas, stops, kill-switch y reconcile de fills.
+- Backtest de cartera con next-open fill, slippage, comisiones y RS.
+
+Cambios clave respecto a la versión anterior:
+  ✔ Toggle MOO/LOO con banda configurable.
+  ✔ Stops: ATR trailing (sobre Supertrend) + Max Loss por trade. 
+  ✔ Kill-switch por drawdown diario.
+  ✔ Filtros de universo: precio mínimo y ADV$ mínimo.
+  ✔ Filtro de earnings ±N días (best-effort via FundamentalData; si no hay datos, omite filtro).
+  ✔ Filtro de régimen de mercado (SPY > SMA200) para entradas long.
+  ✔ Reconciliación de fills al iniciar LIVE (actualiza precio_entrada con avgFillPrice real).
+  ✔ Cache de históricos con prefetch y logs detallados.
+  ✔ Sin datetime.utcnow() (usa timezone-aware UTC).
+"""
+
+# ===================== CONFIGURACIÓN GENERAL =====================
+MODE = "LIVE"                   # "BACKTEST", "LIVE" o "PREOPEN"
 MODE_N = MODE.strip().upper()
 IS_BACKTEST = (MODE_N == "BACKTEST")
 IS_LIVE = (MODE_N == "LIVE")
+
 IB_PORT = 7497
 IB_CLIENT_ID = 1
 EXCHANGE = 'SMART'
 CURRENCY = 'USD'
 
+# Universo (puede reducirse para pruebas y calentar cache más rápido)
 SYMBOLS = [
-    # Tech / Growth
-    'NVDA','META','PLTR','HIMS','AMD','HOOD','TSLA','AAPL','GOOG','AMZN','INTC','NFLX','RDDT','PINS','MSFT','MU',
-    # Industrial / Value
-    'GE','BA','NKE','PG',
-    # Finanzas
-    'JPM','GS','MS','BAC','COIN',
-    # Salud / Pharma
-    'LLY','UNH',
-    # Latam / China
-    'MELI','BBD','NU','PAGS','GGAL','YPF','SUPV','JD','BABA'
+    # TECH / GROWTH
+    'NVDA','AMD','INTC','SMCI','ARM','TSM','MU','AAPL','MSFT','META','GOOG','AMZN','NFLX',
+    'ADBE','CRM','ORCL','NOW','SNOW','DDOG','CRWD','NET','ZS','OKTA','MDB','SHOP','ABNB','UBER','RBLX',
+    'PLTR','RDDT','HOOD','COIN','SOFI','AFRM','AI','IONQ','PATH',
+    # INDUSTRIAL / VALUE
+    'GE','BA','CAT','DE','HON','LMT','RTX',
+    # FINANCE
+    'JPM','GS','MS','BAC','C','WFC','USB','SCHW','AXP','BLK','IBKR','TROW','V','MA','SUPV','NU',
+    # HEALTH
+    'LLY','UNH','JNJ','ABBV','HIMS','VRTX','ISRG','XBI',
+    # INTERNATIONAL / EM
+    'MELI','YPF','PAGS','BBD','JD','BABA','TCEHY','PDD','FXI','EWZ','EWY','EWT','INDA',
+    # ENERGY / MATERIALS
+    'XOM','CVX','OXY','COP','HAL','FCX','CLF','VALE','SCCO','RIO','URA','CCJ',
+    # DEFENSIVE
+    'PEP','COST','WMT','NKE'
 ]
+SYMBOLS = list(dict.fromkeys(SYMBOLS))  # dedupe manteniendo orden
 
-#SYMBOLS = ['RGTI']
-
-# Parámetros (alineados con tu Pine)
-PRICE_SOURCE       = "hl2"    # (H+L)/2 o "close"
+# ===================== PARÁMETROS DE ESTRATEGIA =====================
+PRICE_SOURCE       = "hl2"      # "hl2" o "close"
 MEASUREMENT_NOISE  = 1.0
 PROCESS_NOISE      = 0.01
-ATR_PERIOD         = 1
-ATR_FACTOR         = 0.4
-TIMEFRAME          = '4 hours'  # timeframe para señales
+ATR_PERIOD         = 14         # más estable que 1
+ATR_FACTOR         = 1.5        # más conservador que 0.4
+TIMEFRAME          = '1 day'    # swing sobre diaria
 
-# Benchmark para ranking por fuerza relativa (RS20)
-RS_BENCHMARK     = 'SPY'
+# ===================== RANKING / RS =====================
+RS_BENCHMARK       = 'SPY'
+RS_LOOKBACK_BARS   = 20
+RS_MIN             = 0.03       # gating mínimo de RS (> 3% vs SPY)
 
-# Backtest
-BT_DURATION_STR = '12 M'
-BT_USE_RTH      = True
-POSITION_SIZE   = 5
-STRATEGY        = 'KalmanHullST_BackQuant'
+# ===================== RIESGO / EJECUCIÓN =====================
+MAX_OPEN_TRADES     = 5
+BUDGET_PER_TRADE    = 2000.0      # para LIVE sizing por cash (fallback a BP)
+RESERVE_CASH_PCT    = 0.05
+USE_BUYING_POWER    = False
+BP_TRADE_CAP        = 1800.0
+BP_RESERVE_PCT      = 0.10
 
-# === SIZING (LIVE) POR MONTO FIJO Y FALLBACK A BUYING POWER ===
-MAX_OPEN_TRADES   = 6        # máximo de operaciones ABIERTAS simultáneas
-BUDGET_PER_TRADE  = 600.0    # USD por trade usando CASH
-COMMISSION_OPEN   = 1.0      # comisión estimada por orden (apertura)
-RESERVE_CASH_PCT  = 0.05     # deja 5% del cash libre
+USE_LOO             = True       # True=Limit-On-Open, False=Market-On-Open
+LOO_BAND_PCT_BUY    = 0.05       # BUY hasta +5% del cierre
+LOO_BAND_PCT_SELL   = 0.05       # SELL hasta -5% del cierre
 
-USE_BUYING_POWER  = True     # permitir uso de Buying Power si el cash no alcanza
-BP_TRADE_CAP      = 1800.0   # tope USD por trade cuando se usa Buying Power
-BP_RESERVE_PCT    = 0.10     # deja 10% del BP libre
+STOP_ATR_MULT       = 2.5        # trailing con ATR*mult (apoya al Supertrend)
+MAX_LOSS_PCT        = 0.05       # hard stop vs entry
+KILL_SWITCH_DD_PCT  = 0.02       # cierra todo si DD estimado del día <-2% del NLV
 
-# =============== BASE DE DATOS ===============
+MIN_PRICE           = 5.0       # filtro universo: precio mínimo
+ADV_MIN_USD         = 25_000_000 # filtro universo: dólar volumen promedio (≈20 días)
+
+EARNINGS_FILTER_ENABLED = False
+EARNINGS_DAYS_WINDOW   = 3       # excluir ±3 días de earnings
+
+REQUIRE_MARKET_UPTREND = True    # filtra entradas long si mercado bajista
+SMA_UPTREND_LEN        = 200
+
+# ===================== BACKTEST =====================
+BT_DURATION_STR   = '2 Y'
+BT_USE_RTH        = True
+COMMISSION_OPEN   = 1.0
+COMMISSION_CLOSE  = 1.0
+SLIPPAGE_PER_SH   = 0.02
+RUN_PORTFOLIO_BT  = True
+BT_STARTING_CASH  = 4_000.0
+
+# ===================== CACHE =====================
+CACHE_DIR = 'data_cache'
+ENABLE_PREFETCH = True
+PACING_SECONDS = 0.8
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# ===================== DB =====================
 DB_FILE = 'trades.db'
 conn = sqlite3.connect(DB_FILE)
 cur = conn.cursor()
@@ -82,8 +136,6 @@ CREATE TABLE IF NOT EXISTS operaciones (
 )
 ''')
 conn.commit()
-
-# Índice único para evitar más de una ABIERTA por ticker
 cur.execute("""
 CREATE UNIQUE INDEX IF NOT EXISTS idx_op_open
 ON operaciones(ticker, estado)
@@ -91,40 +143,49 @@ WHERE estado = 'ABIERTA';
 """)
 conn.commit()
 
-# =============== CONEXIÓN A IBKR (para históricos y LIVE) ===============
+# ===================== CONEXIÓN IBKR =====================
 ib = IB()
 ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
 print(f"Conectado a IBKR | MODE={MODE}")
-# =============== RECONEXIÓN Y HORARIO DE MERCADO ===============
-import pytz
+
+# ===================== HELPERS IBKR / CONTRATOS =====================
+def resolve_contract(symbol: str) -> Contract | None:
+    try:
+        c = Stock(symbol, EXCHANGE, CURRENCY)
+        q = ib.qualifyContracts(c)
+        if q:
+            return q[0]
+    except Exception as e:
+        print(f"[QUALIFY][{symbol}] {e}")
+    for px in ("NYSE", "NASDAQ", "ARCA"):
+        try:
+            c = Stock(symbol, EXCHANGE, CURRENCY, primaryExchange=px)
+            q = ib.qualifyContracts(c)
+            if q:
+                return q[0]
+        except Exception:
+            pass
+    print(f"[QUALIFY][{symbol}] No se pudo calificar")
+    return None
+
 
 def ensure_ib_connection():
-    """Reintenta conexión si IBKR se desconectó."""
     global ib
     if ib is None or not ib.isConnected():
-        print("[LIVE][WARN] Desconectado de IBKR, intentando reconectar...")
         try:
             ib.disconnect()
         except Exception:
             pass
-        try:
-            ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
-            print("[LIVE] Reconexión exitosa.")
-        except Exception as e:
-            print(f"[LIVE][ERROR] Fallo al reconectar: {e}")
-            time.sleep(30)  # espera antes de reintentar
+        ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
+        print("[IBKR] Reconectado.")
+
 
 def market_is_open() -> bool:
-    """True si el mercado USA (NYSE/NASDAQ) está abierto ahora (9:30–16:00 EST)."""
-    from datetime import datetime, time
-    now = datetime.now(pytz.timezone("US/Eastern"))
-    open_t, close_t = time(9, 30), time(16, 0)
-    return open_t <= now.time() <= close_t
+    now = datetime.now(pytz.timezone("US/Eastern")).time()
+    return dtime(9, 30) <= now <= dtime(16, 0)
 
-
-# =============== UTILIDADES INDICADORES ===============
+# ===================== INDICADORES =====================
 def f_kalman_streaming(prices, measurement_noise=1.0, process_noise=0.01):
-    """Kalman simple iterativo (como en Pine)."""
     state = float(prices.iloc[0])
     p = 1.0
     out = [state]
@@ -137,7 +198,6 @@ def f_kalman_streaming(prices, measurement_noise=1.0, process_noise=0.01):
     return pd.Series(out, index=prices.index)
 
 def khma(series, length=1.0, process_noise=0.01):
-    """Kalman-Hull: Kalman(length/2), Kalman(length), diff -> Kalman(sqrt(length))."""
     inner1 = f_kalman_streaming(series, length/2, process_noise)
     inner2 = f_kalman_streaming(series, length, process_noise)
     diff = 2*inner1 - inner2
@@ -153,193 +213,292 @@ def true_range(df):
     tr3 = (df['low'] - df['close'].shift(1)).abs()
     return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-def supertrend_backquant(df, factor=0.4, atr_period=1, src_col="kalman_hma"):
-    """
-    Supertrend (lógica BackQuant). Convención de Pine:
-      direction = -1 → tendencia alcista (línea abajo → LONG)
-      direction =  1 → tendencia bajista  (línea arriba → SHORT)
-    """
+def supertrend_backquant(df, factor=1.5, atr_period=14, src_col="kalman_hma"):
     df['tr'] = true_range(df)
     df['atr'] = rma(df['tr'], max(1, atr_period))
-
     upper = df[src_col] + factor * df['atr']
     lower = df[src_col] - factor * df['atr']
 
     supertrend = np.full(len(df), np.nan)
     direction = np.zeros(len(df))
-
-    # Arrastre de bandas
-    upper = upper.copy()
-    lower = lower.copy()
+    upper = upper.copy(); lower = lower.copy()
 
     for i in range(1, len(df)):
         prev_lower = lower.iloc[i-1]
         prev_upper = upper.iloc[i-1]
         prev_super = supertrend[i-1]
-
         if not (lower.iloc[i] > prev_lower or df['close'].iloc[i-1] < prev_lower):
             lower.iloc[i] = prev_lower
         if not (upper.iloc[i] < prev_upper or df['close'].iloc[i-1] > prev_upper):
             upper.iloc[i] = prev_upper
-
         if np.isnan(df['atr'].iloc[i-1]):
             direction[i] = 1
-        elif prev_super == prev_upper:
+            supertrend[i] = upper.iloc[i]
+            continue
+        if prev_super == prev_upper:
             direction[i] = -1 if df['close'].iloc[i] > upper.iloc[i] else 1
         else:
             direction[i] = 1 if df['close'].iloc[i] < lower.iloc[i] else -1
-
         supertrend[i] = lower.iloc[i] if direction[i] == -1 else upper.iloc[i]
-
     df['supertrend'] = supertrend
     df['direction'] = direction
     return df
 
-# =============== DATA & FEATURES ===============
-def fetch_history(symbol, durationStr, barSize='1 hour', useRTH=True):
-    contract = Stock(symbol, EXCHANGE, CURRENCY)
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime='',
-        durationStr=durationStr,
-        barSizeSetting=barSize,
-        whatToShow='TRADES',
-        useRTH=useRTH,
-        formatDate=1
-    )
-    df = util.df(bars)
-    if df is None or df.empty:
-        return None
-    df.drop_duplicates(subset=['date'], inplace=True)
-    df.sort_values('date', inplace=True, ignore_index=True)
-    # Fuente de precio
-    if PRICE_SOURCE.lower() == 'hl2':
-        df['src'] = (df['high'] + df['low']) / 2.0
+# ===================== CACHE =====================
+def _cache_path(symbol: str, durationStr: str, barSize: str, useRTH: bool, ext="parquet") -> str:
+    safe = lambda s: str(s).replace(" ", "")
+    return os.path.join(CACHE_DIR, f"{symbol}_{safe(durationStr)}_{safe(barSize)}_{'RTH' if useRTH else 'ALL'}.{ext}")
+
+def _load_cached(symbol, durationStr, barSize, useRTH):
+    p = _cache_path(symbol, durationStr, barSize, useRTH, 'parquet')
+    if os.path.exists(p):
+        try:
+            df = pd.read_parquet(p)
+            df['date'] = pd.to_datetime(df['date'])
+            return df
+        except Exception:
+            pass
+    p = _cache_path(symbol, durationStr, barSize, useRTH, 'csv')
+    if os.path.exists(p):
+        try:
+            return pd.read_csv(p, parse_dates=['date'])
+        except Exception:
+            pass
+    return None
+
+def _save_cache(df, symbol, durationStr, barSize, useRTH):
+    cols = [c for c in ['date','open','high','low','close','volume'] if c in df.columns]
+    df2 = df[cols].copy()
+    try:
+        p = _cache_path(symbol, durationStr, barSize, useRTH, 'parquet'); tmp=p+'.tmp'
+        df2.to_parquet(tmp, index=False); os.replace(tmp, p); return
+    except Exception:
+        p = _cache_path(symbol, durationStr, barSize, useRTH, 'csv'); tmp=p+'.tmp'
+        df2.to_csv(tmp, index=False); os.replace(tmp, p)
+
+# ===================== HISTÓRICO + FEATURES =====================
+def _get_history_ib(contract, durationStr, barSize, useRTH, retries=3, base_sleep=1.2):
+    for i in range(retries):
+        try:
+            bars = ib.reqHistoricalData(contract, '', durationStr, barSize, 'TRADES', useRTH, 1)
+            return util.df(bars)
+        except Exception as e:
+            wait = base_sleep * (2**i)
+            print(f"[HIST][WARN] {contract.localSymbol}: {e} (retry {i+1}/{retries} {wait:.1f}s)")
+            time.sleep(wait); ensure_ib_connection()
+    return 
+
+def refresh_cache_incremental(symbol, durationStr, barSize='1 day', useRTH=True, max_back_days=10):
+    """
+    Actualiza el cache 'data_cache' solo con velas faltantes.
+    """
+    cached = _load_cached(symbol, durationStr, barSize, useRTH)
+    if cached is None or cached.empty:
+        ensure_ib_connection()
+        c = resolve_contract(symbol)
+        if c is None:
+            print(f"[REFRESH][{symbol}] sin contrato IBKR")
+            return None
+        df = _get_history_ib(c, durationStr, barSize, useRTH)
+        if df is None or df.empty:
+            print(f"[REFRESH][{symbol}] sin datos iniciales")
+            return None
+        # forzar timezone UTC
+        df['date'] = pd.to_datetime(df['date'], utc=True)
+        df = df.drop_duplicates('date').sort_values('date', ignore_index=True)
+        _save_cache(df, symbol, durationStr, barSize, useRTH)
+        print(f"[REFRESH][{symbol}] cache inicial creado ({len(df)} velas)")
+        time.sleep(PACING_SECONDS)
+        return df
+
+    # --- cache caliente ---
+    cached['date'] = pd.to_datetime(cached['date'], utc=True)   # <<--- 🔥 fuerza UTC
+    cached = cached.drop_duplicates('date').sort_values('date', ignore_index=True)
+    last_dt = cached['date'].iloc[-1]
+    now_et = pd.Timestamp(datetime.now(pytz.timezone('US/Eastern'))).tz_convert('UTC')  # 🔥 también en UTC
+
+    # Heurística: ¿hay vela nueva?
+    if barSize == '1 day':
+        need_update = now_et.normalize() > last_dt.normalize()
     else:
-        df['src'] = df['close']
-    # Indicadores
+        need_update = (now_et - last_dt) > pd.Timedelta(hours=1)
+
+    if not need_update:
+        return cached
+
+    # Calcular días a descargar (corrigiendo tipo)
+    days_gap = max(1, int((now_et.date() - last_dt.date()).days) + 2)
+    days_pull = min(max_back_days, days_gap)
+
+    ensure_ib_connection()
+    c = resolve_contract(symbol)
+    if c is None:
+        print(f"[REFRESH][{symbol}] no se pudo calificar contrato")
+        return cached
+
+    tail = _get_history_ib(c, f'{days_pull} D', barSize, useRTH)
+    tail['date'] = pd.to_datetime(tail['date'], utc=True)
+
+    if tail is None or tail.empty:
+        print(f"[REFRESH][{symbol}] sin nuevas velas")
+        return cached
+
+    tail = tail.drop_duplicates('date').sort_values('date', ignore_index=True)
+    merged = pd.concat([cached, tail], ignore_index=True)
+    merged = merged.drop_duplicates('date').sort_values('date', ignore_index=True)
+
+    added = len(merged) - len(cached)
+    _save_cache(merged, symbol, durationStr, barSize, useRTH)
+    print(f"[REFRESH][{symbol}] cache actualizado (+{added} nuevas velas, última={merged['date'].iloc[-1].date()})")
+    time.sleep(PACING_SECONDS)
+    return merged
+
+
+
+def fetch_history(symbol, durationStr, barSize='1 day', useRTH=True, use_cache=True, refresh_cache=False):
+    # 1) Traer/crear cache
+    raw = None
+    if use_cache and not refresh_cache:
+        raw = _load_cached(symbol, durationStr, barSize, useRTH)
+
+    if refresh_cache:
+        raw = refresh_cache_incremental(symbol, durationStr, barSize, useRTH)
+    elif raw is None:
+        # cache ausente → descarga completa
+        ensure_ib_connection()
+        c = resolve_contract(symbol)
+        if c is None: return None
+        df = _get_history_ib(c, durationStr, barSize, useRTH)
+        if df is None or df.empty: return None
+        df = df.drop_duplicates('date').sort_values('date', ignore_index=True)
+        _save_cache(df, symbol, durationStr, barSize, useRTH)
+        raw = df
+        time.sleep(PACING_SECONDS)
+    else:
+        raw = raw.drop_duplicates('date').sort_values('date', ignore_index=True)
+
+    # 2) Features/indicadores (idéntico a lo que ya tenés)
+    df = raw.copy()
+    df['src'] = (df['high'] + df['low'])/2.0 if PRICE_SOURCE=='hl2' else df['close']
     df['kalman_hma'] = khma(df['src'], MEASUREMENT_NOISE, PROCESS_NOISE)
     df = supertrend_backquant(df, factor=ATR_FACTOR, atr_period=ATR_PERIOD, src_col='kalman_hma')
-    # Señales (al cierre de vela): cruces de direction por 0
     df['signal'] = 0
-    cross_long  = (df['direction'].shift(1) > 0) & (df['direction'] < 0)   # +1 -> -1
-    cross_short = (df['direction'].shift(1) < 0) & (df['direction'] > 0)   # -1 -> +1
+    cross_long  = (df['direction'].shift(1) > 0) & (df['direction'] < 0)
+    cross_short = (df['direction'].shift(1) < 0) & (df['direction'] > 0)
     df.loc[cross_long, 'signal'] = 1
     df.loc[cross_short, 'signal'] = -1
     return df
 
-# =============== PERSISTENCIA DE TRADES (BACKTEST) ===============
-# =============== RANKING POR RS20 (mínimo cambio) ===============
-def _rs20(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> float:
-    """
-    Devuelve RS20 = retorno 20 velas del ticker menos retorno 20 velas del benchmark.
-    Si bench_df es None o insuficiente, usa el retorno simple del ticker.
-    """
+
+# ===================== RS / RÉGIMEN / FILTROS =====================
+def _rs20_score(df_sym: pd.DataFrame, df_bench: pd.DataFrame | None) -> float:
     try:
-        if df is None or len(df) < 21:
-            return float("-1e9")
-        r_t = float(df['close'].iloc[-1] / df['close'].iloc[-20] - 1.0)
-        if bench_df is None or len(bench_df) < 21:
-            return r_t
-        r_b = float(bench_df['close'].iloc[-1] / bench_df['close'].iloc[-20] - 1.0)
+        if df_sym is None or len(df_sym) < 21: return -1e9
+        r_t = float(df_sym['close'].iloc[-1] / df_sym['close'].iloc[-20] - 1.0)
+        if df_bench is None or len(df_bench) < 21: return r_t
+        r_b = float(df_bench['close'].iloc[-1] / df_bench['close'].iloc[-20] - 1.0)
         return r_t - r_b
     except Exception:
-        return float("-1e9")
+        return -1e9
 
 def rank_candidates_rs20(symbols: list[str], timeframe: str) -> list[str]:
-    """
-    Ordena símbolos por RS20 descendente (benchmark RS_BENCHMARK).
-    No altera tu lógica de señales/entradas/salidas; solo cambia el orden en que se analizan.
-    """
-    bench = None
-    if RS_BENCHMARK:
-        try:
-            bench = fetch_history(RS_BENCHMARK, '2 M', timeframe, True)
-        except Exception as e:
-            print(f"[RANK_RS20] No se pudo cargar benchmark {RS_BENCHMARK}: {e}")
-            bench = None
-
+    bench = fetch_history(RS_BENCHMARK, '2 M', timeframe, True, use_cache=True) if RS_BENCHMARK else None
     scored = []
-    for sym in symbols:
-        try:
-            df = fetch_history(sym, '2 M', timeframe, True)
-            if df is None or df.empty:
-                continue
-            score = _rs20(df, bench)
-            scored.append((sym, score))
-        except Exception as e:
-            print(f"[RANK_RS20][{sym}] {e}")
-
+    for i, sym in enumerate(symbols, 1):
+        df = fetch_history(sym, '2 M', TIMEFRAME, True, use_cache=True, refresh_cache=True)
+        if df is None or df.empty: continue
+        score = _rs20_score(df, bench)
+        scored.append((sym, score))
+        if i % 25 == 0: print(f"[PREOPEN][RS] rankeados {i}/{len(symbols)}...")
     scored.sort(key=lambda x: x[1], reverse=True)
-    # opcional: print corto de scores
-    if scored:
-        preview = ", ".join([f"{s}:{sc:.3f}" for s, sc in scored[:10]])
-        print(f"[RANK_RS20] Top (preview): {preview}")
-    return [s for s, _ in scored]
+    return [s for s,_ in scored]
 
-def insert_trade_closed(symbol, qty, entry_price, exit_price, entry_dt, exit_dt, comentario):
-    pnl = (exit_price - entry_price) * qty
-    retorno_pct = (exit_price / entry_price - 1) * 100.0
-    dur_h = (pd.to_datetime(exit_dt) - pd.to_datetime(entry_dt)).total_seconds() / 3600.0
-    cur.execute('''
-        INSERT INTO operaciones (ticker, tipo, cantidad, precio_entrada, precio_salida,
-                                 fecha_apertura, fecha_cierre, estado, pnl, retorno_pct,
-                                 duracion_horas, estrategia, comentario)
-        VALUES (?, 'LONG', ?, ?, ?, ?, ?, 'CERRADA', ?, ?, ?, ?, ?)
-    ''', (symbol, qty, entry_price, exit_price, str(entry_dt), str(exit_dt),
-          pnl, retorno_pct, dur_h, STRATEGY, comentario))
+
+def avg_dollar_volume_usd(symbol: str, lookback_days: int = 20) -> float:
+    df = fetch_history(symbol, '3 M', '1 day', True, use_cache=True)
+    if df is None or len(df) < lookback_days+1: return 0.0
+    tail = df.iloc[-lookback_days:]
+    return float((tail['close'] * tail['volume']).mean())
+
+
+def get_last_close(symbol: str) -> float:
+    df = fetch_history(symbol, '2 M', '1 day', True, use_cache=True)
+    if df is None or df.empty: return 0.0
+    return float(df['close'].iloc[-1])
+
+
+def market_uptrend_ok() -> bool:
+    if not REQUIRE_MARKET_UPTREND: return True
+    df = fetch_history(RS_BENCHMARK, '2 Y', '1 day', True, use_cache=True)
+    if df is None or len(df) < SMA_UPTREND_LEN+1: return True
+    sma = df['close'].rolling(SMA_UPTREND_LEN).mean()
+    return bool(df['close'].iloc[-1] > sma.iloc[-1])
+
+# ===================== EARNINGS (best-effort) =====================
+def _parse_calendar_dates(xml_str: str) -> list[datetime]:
+    try:
+        root = ET.fromstring(xml_str)
+        out = []
+        for elem in root.iter():
+            tag = elem.tag.lower()
+            if 'earn' in tag and ('date' in tag or tag.endswith('date')):
+                try:
+                    d = pd.to_datetime(elem.text).to_pydatetime()
+                    out.append(d)
+                except Exception:
+                    pass
+        return out
+    except Exception:
+        return []
+
+
+def is_in_earnings_window(symbol: str, window_days: int = EARNINGS_DAYS_WINDOW) -> bool:
+    if not EARNINGS_FILTER_ENABLED: return False
+    try:
+        c = resolve_contract(symbol)
+        if c is None: return False
+        xml = ib.reqFundamentalData(c, reportType='CalendarReport')
+        if not xml: return False
+        dates = _parse_calendar_dates(xml)
+        if not dates: return False
+        today = datetime.now(timezone.utc)
+        for d in dates:
+            # comparar en días absolutos
+            if abs((d - today).days) <= window_days:
+                return True
+        return False
+    except Exception:
+        # si no hay permiso/no disponible, no bloquea
+        return False
+
+# ===================== DB OPS =====================
+def insert_trade_open_db(symbol: str, qty: int, entry_price: float, comentario: str):
+    now = datetime.now(timezone.utc).isoformat()
+    cur.execute("""
+        INSERT INTO operaciones
+        (ticker, tipo, cantidad, precio_entrada, precio_salida,
+         fecha_apertura, fecha_cierre, estado, pnl, retorno_pct,
+         duracion_horas, estrategia, comentario)
+        VALUES (?, 'LONG', ?, ?, NULL, ?, NULL, 'ABIERTA', NULL, NULL, NULL, ?, ?)
+    """, (symbol, qty, entry_price, now, 'KalmanHullST_BackQuant', comentario))
     conn.commit()
 
-# =============== ACCOUNT / SIZING HELPERS (LIVE) ===============
-def _acct_val(tag: str, currency: str = "USD") -> float:
-    """Lee un tag puntual del Account Summary (USD)."""
-    try:
-        for x in ib.accountSummary():
-            if x.tag == tag and x.currency == currency:
-                return float(x.value)
-    except Exception:
-        pass
-    return 0.0
 
-def get_available_funds_usd() -> float:
-    """Fondos disponibles para abrir posiciones (cash/margen ya considerados por IBKR)."""
-    val = _acct_val("AvailableFunds", "USD")
-    if val == 0.0:
-        # Fallback razonable para cash accounts
-        val = _acct_val("TotalCashValue", "USD")
-    return max(0.0, val)
+def get_open_trade_info(symbol: str):
+    cur.execute("""
+        SELECT id, cantidad, precio_entrada, fecha_apertura
+        FROM operaciones
+        WHERE ticker=? AND estado='ABIERTA'
+        ORDER BY id DESC
+        LIMIT 1
+    """, (symbol,))
+    return cur.fetchone()
 
-def get_buying_power_usd() -> float:
-    """Buying Power (Reg-T). En margen suele ser ~4× 'AvailableFunds' intradía."""
-    return max(0.0, _acct_val("BuyingPower", "USD"))
 
-def calc_qty_by_cash(price: float, available_usd: float) -> int:
-    """Cantidad por presupuesto de cash fijo (BUDGET_PER_TRADE), con reserva y comisión."""
-    if price <= 0:
-        return 0
-    budget_eff = min(BUDGET_PER_TRADE, max(0.0, available_usd * (1.0 - RESERVE_CASH_PCT)))
-    if budget_eff <= COMMISSION_OPEN:
-        return 0
-    return max(0, math.floor((budget_eff - COMMISSION_OPEN) / price))
-
-def calc_qty_by_bp(price: float, buying_power_usd: float) -> int:
-    """
-    Cantidad por presupuesto de buying power. Usamos el menor entre:
-    - CAP por trade (BP_TRADE_CAP)
-    - Buying Power disponible (con reserva)
-    """
-    if price <= 0:
-        return 0
-    bp_eff = min(BP_TRADE_CAP, max(0.0, buying_power_usd * (1.0 - BP_RESERVE_PCT)))
-    if bp_eff <= COMMISSION_OPEN:
-        return 0
-    return max(0, math.floor((bp_eff - COMMISSION_OPEN) / price))
-
-# =============== HELPERS DB PARA LIVE (estado 100% desde DB) ===============
 def open_trades_count() -> int:
     cur.execute("SELECT COUNT(*) FROM operaciones WHERE estado='ABIERTA'")
-    x = cur.fetchone()
-    return int(x[0]) if x and x[0] is not None else 0
+    x = cur.fetchone(); return int(x[0]) if x and x[0] is not None else 0
+
 
 def symbol_has_open(symbol: str) -> bool:
     cur.execute("SELECT 1 FROM operaciones WHERE ticker=? AND estado='ABIERTA' LIMIT 1", (symbol,))
@@ -350,51 +509,22 @@ def get_open_symbols_db() -> list[str]:
     rows = cur.fetchall()
     return [r[0] for r in rows] if rows else []
 
-def get_open_trade_info(symbol: str):
-    """
-    Devuelve (id, cantidad, precio_entrada, fecha_apertura) para el ticker ABIERTA más reciente.
-    """
-    cur.execute("""
-        SELECT id, cantidad, precio_entrada, fecha_apertura
-        FROM operaciones
-        WHERE ticker=? AND estado='ABIERTA'
-        ORDER BY id DESC
-        LIMIT 1
-    """, (symbol,))
-    return cur.fetchone()
 
-def insert_trade_open_db(symbol: str, qty: int, entry_price: float, comentario: str = 'LIVE'):
-    now = datetime.utcnow().isoformat()
-    cur.execute("""
-        INSERT INTO operaciones
-        (ticker, tipo, cantidad, precio_entrada, precio_salida,
-         fecha_apertura, fecha_cierre, estado, pnl, retorno_pct,
-         duracion_horas, estrategia, comentario)
-        VALUES (?, 'LONG', ?, ?, NULL, ?, NULL, 'ABIERTA', NULL, NULL, NULL, ?, ?)
-    """, (symbol, qty, entry_price, now, STRATEGY, comentario))
-    conn.commit()
 
 def close_trade_db(symbol: str, exit_price: float, comentario_extra: str = 'LIVE CLOSE'):
-    """
-    Cierra la operación ABIERTA del símbolo calculando PnL/retorno/duración y marcando estado=CERRADA.
-    """
     row = get_open_trade_info(symbol)
     if not row:
-        print(f"[DB] No encontré ABIERTA para {symbol} al cerrar.")
-        return
+        print(f"[DB] No ABIERTA para {symbol}"); return
     op_id, qty, entry_price, fecha_apertura = row
     if qty is None or entry_price is None or fecha_apertura is None:
-        print(f"[DB] Datos incompletos para cerrar {symbol} (op_id={op_id}).")
-        return
-
-    now_iso = datetime.utcnow().isoformat()
-    pnl = (exit_price - float(entry_price)) * float(qty)
+        print(f"[DB] Datos incompletos {symbol}"); return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pnl = (exit_price - float(entry_price)) * float(qty) - COMMISSION_CLOSE
     retorno_pct = (exit_price / float(entry_price) - 1.0) * 100.0
     try:
         dur_h = (pd.to_datetime(now_iso) - pd.to_datetime(fecha_apertura)).total_seconds() / 3600.0
     except Exception:
         dur_h = None
-
     cur.execute("""
         UPDATE operaciones
         SET precio_salida=?, fecha_cierre=?, estado='CERRADA',
@@ -404,255 +534,565 @@ def close_trade_db(symbol: str, exit_price: float, comentario_extra: str = 'LIVE
     """, (exit_price, now_iso, pnl, retorno_pct, dur_h, comentario_extra, op_id))
     conn.commit()
 
-# =============== BACKTEST ENGINE ===============
+# ===================== CUENTA / SIZING =====================
+def _acct_val(tag: str, currency: str = "USD") -> float:
+    try:
+        for x in ib.accountSummary():
+            if x.tag == tag and x.currency == currency:
+                return float(x.value)
+    except Exception:
+        pass
+    return 0.0
+
+def get_available_funds_usd() -> float:
+    v = _acct_val("AvailableFunds", "USD")
+    if v == 0.0: v = _acct_val("TotalCashValue", "USD")
+    return max(0.0, v)
+
+def get_buying_power_usd() -> float:
+    return max(0.0, _acct_val("BuyingPower", "USD"))
+
+def get_net_liq_usd() -> float:
+    v = _acct_val("NetLiquidation", "USD")
+    if v == 0.0: v = _acct_val("TotalCashValue", "USD")
+    return max(0.0, v)
+
+def calc_qty_by_cash(price: float, available_usd: float) -> int:
+    if price <= 0: return 0
+    budget_eff = min(BUDGET_PER_TRADE, max(0.0, available_usd * (1.0 - RESERVE_CASH_PCT)))
+    if budget_eff <= COMMISSION_OPEN: return 0
+    return max(0, math.floor((budget_eff - COMMISSION_OPEN) / (price + SLIPPAGE_PER_SH)))
+
+def calc_qty_by_bp(price: float, buying_power_usd: float) -> int:
+    if price <= 0: return 0
+    bp_eff = min(BP_TRADE_CAP, max(0.0, buying_power_usd * (1.0 - BP_RESERVE_PCT)))
+    if bp_eff <= COMMISSION_OPEN: return 0
+    return max(0, math.floor((bp_eff - COMMISSION_OPEN) / (price + SLIPPAGE_PER_SH)))
+
+# ===================== PREOPEN: COLOCAR ÓRDENES PARA APERTURA =====================
+VERBOSE_PREOPEN = True
+
+def _place_MOO(contract: Contract, action: str, qty: int):
+    o = MarketOrder(action, qty); o.tif='OPG'; o.outsideRth=False; ib.placeOrder(contract, o)
+
+def _place_LOO(contract: Contract, action: str, qty: int, lmt: float):
+    o = LimitOrder(action, qty, lmt); o.tif='OPG'; o.outsideRth=False; ib.placeOrder(contract, o)
+
+
+def _passes_universe_filters(sym: str) -> tuple[bool, str, float]:
+    px = get_last_close(sym)
+    if px <= 0: return (False, "sin_datos", px)
+    if px < MIN_PRICE: return (False, f"precio<{MIN_PRICE}", px)
+    adv = avg_dollar_volume_usd(sym, 20)
+    if adv < ADV_MIN_USD: return (False, f"ADV${adv:,.0f}<{ADV_MIN_USD:,.0f}", px)
+    if is_in_earnings_window(sym, EARNINGS_DAYS_WINDOW):
+        return (False, "earnings_window", px)
+    return (True, "ok", px)
+
+
+def queue_orders_for_next_open():
+    print(" [PREOPEN] Preparando órdenes para la próxima apertura según la última vela cerrada...")
+
+    # Cierres primero
+    open_syms = [s for s in get_open_symbols_db()]
+    for sym in open_syms:
+        df = fetch_history(sym, '2 M', TIMEFRAME, True, use_cache=True, refresh_cache=True)
+        if df is None or df.empty: continue
+        last = df.iloc[-1]
+        sig = int(last['signal']); direction = int(last['direction']); close_px = float(last['close'])
+        if (sig == -1) or (direction == 1):
+            info = get_open_trade_info(sym)
+            if not info: continue
+            _, qty_open, _, _ = info
+            qty = int(qty_open) if qty_open else 0
+            if qty < 1: continue
+            c = resolve_contract(sym)
+            if c is None: continue
+            if USE_LOO:
+                lmt = close_px * (1.0 - LOO_BAND_PCT_SELL)
+                print(f"[PREOPEN] SELL LOO OPG: {sym} x{qty} @>= {lmt:.2f}")
+                _place_LOO(c, 'SELL', qty, lmt)
+            else:
+                print(f"[PREOPEN] SELL MOO OPG: {sym} x{qty}")
+                _place_MOO(c, 'SELL', qty)
+            cur.execute("""
+                UPDATE operaciones
+                SET comentario=COALESCE(comentario,'') || ' | PREOPEN: SELL OPG queued'
+                WHERE ticker=? AND estado='ABIERTA'
+            """, (sym,)); conn.commit()
+        elif VERBOSE_PREOPEN:
+            print(f"[PREOPEN][HOLD] {sym}: sig={sig}, dir={direction}")
+
+    # Entradas
+    if REQUIRE_MARKET_UPTREND and not market_uptrend_ok():
+        print("[PREOPEN] Mercado NO en uptrend (SPY vs SMA200). No se colocan nuevas entradas.")
+        return
+
+    current_open = open_trades_count()
+    free_slots = max(0, MAX_OPEN_TRADES - current_open)
+    if free_slots <= 0:
+        print(f"[PREOPEN] Cupo completo {current_open}/{MAX_OPEN_TRADES}. Sin nuevas entradas.")
+        return
+
+    base = [s for s in SYMBOLS if not symbol_has_open(s)]
+    # filtros de universo
+    filtered = []
+    for s in base:
+        ok, why, px = _passes_universe_filters(s)
+        if ok:
+            filtered.append(s)
+        elif VERBOSE_PREOPEN:
+            print(f"[PREOPEN][SKIP] {s}: {why}")
+
+    if not filtered:
+        print("[PREOPEN] No quedan candidatos tras filtros de universo.")
+        return
+
+    ranked = rank_candidates_rs20(filtered, TIMEFRAME)
+
+    for sym in ranked:
+        if open_trades_count() >= MAX_OPEN_TRADES: break
+        df = fetch_history(sym, '2 M', TIMEFRAME, True, use_cache=True, refresh_cache=True)
+        if df is None or df.empty: continue
+        last = df.iloc[-1]
+        sig = int(last['signal']); direction = int(last['direction']); close_px = float(last['close'])
+        rs_val = _rs20_score(df, fetch_history(RS_BENCHMARK, '2 M', TIMEFRAME, True, use_cache=True))
+        if pd.isna(rs_val) or (rs_val <= RS_MIN):
+            if VERBOSE_PREOPEN: print(f"[PREOPEN][SKIP RS] {sym}: rs={rs_val:.4f}")
+            continue
+        if (sig == 1) or (direction == -1):
+            avail_cash = get_available_funds_usd()
+            qty = calc_qty_by_cash(close_px, avail_cash); src = 'CASH'
+            if qty < 1 and USE_BUYING_POWER:
+                bp = get_buying_power_usd(); qbp = calc_qty_by_bp(close_px, bp)
+                if qbp >= 1: qty = qbp; src = 'BP'
+            if qty < 1:
+                print(f"[PREOPEN][SKIP $] {sym}: sin saldo suficiente.")
+                continue
+            c = resolve_contract(sym)
+            if c is None: continue
+            if USE_LOO:
+                lmt = close_px * (1.0 + LOO_BAND_PCT_BUY)
+                print(f"[PREOPEN] BUY LOO OPG: {sym} x{qty} @<= {lmt:.2f} (via {src}) | rs={rs_val:.4f}")
+                _place_LOO(c, 'BUY', qty, lmt)
+            else:
+                print(f"[PREOPEN] BUY MOO OPG: {sym} x{qty} (via {src}) | rs={rs_val:.4f}")
+                _place_MOO(c, 'BUY', qty)
+            insert_trade_open_db(sym, qty, entry_price=close_px, comentario='PREOPEN OPG queued')
+        elif VERBOSE_PREOPEN:
+            print(f"[PREOPEN][NO-ENTRY] {sym}: sig={sig} dir={direction}")
+
+# ===================== RECONCILIAR FILLS (LIVE) =====================
+def reconcile_fills_update_db():
+    try:
+        fills = ib.fills()  # lista de Fill objects
+    except Exception as e:
+        print(f"[RECONCILE][WARN] {e}")
+        return
+    if not fills:
+        print("[RECONCILE] Sin fills para actualizar.")
+        return
+    updated = 0
+    for f in fills:
+        try:
+            sym = f.contract.symbol
+            avg = float(f.execution.avgPrice or f.execution.price)
+            side = f.execution.side.upper()
+            # Si es BUY y tenemos ABIERTA con precio_entrada ~ cierre (PREOPEN), actualizar
+            if side == 'BOT' or side == 'BUY':
+                row = get_open_trade_info(sym)
+                if row:
+                    op_id, qty, entry_price, _ = row
+                    if entry_price is not None and abs(avg - float(entry_price)) > 1e-6:
+                        cur.execute("UPDATE operaciones SET precio_entrada=? WHERE id=?", (avg, op_id))
+                        conn.commit(); updated += 1
+        except Exception:
+            pass
+    print(f"[RECONCILE] Entradas actualizadas con avgFillPrice: {updated}")
+
+# ===================== STOPS / LIVE ANALYSIS =====================
+
+def _should_stop(symbol: str, df: pd.DataFrame, entry_px: float) -> bool:
+    last = df.iloc[-1]
+    close_px = float(last['close'])
+    # Hard stop por %
+    if close_px <= entry_px * (1.0 - MAX_LOSS_PCT):
+        return True
+    # Trailing por Supertrend (si pasa por debajo de la línea en long)
+    st = float(last['supertrend']) if not pd.isna(last['supertrend']) else None
+    if st is not None and close_px < st:
+        return True
+    # ATR trailing opcional (si querés más estricto: entry - ATR*mult)
+    atr = float(last['atr']) if 'atr' in last.index and not pd.isna(last['atr']) else None
+    if atr is not None and close_px <= (entry_px - STOP_ATR_MULT * atr):
+        return True
+    return False
+
+
+def analyze_symbol_live(symbol):
+    df = fetch_history(symbol, '2 M', TIMEFRAME, True, use_cache=False)
+    if df is None or df.empty:
+        print(f"[LIVE][WARN] Sin datos {symbol}")
+        return
+    last = df.iloc[-1]
+    sig = int(last['signal']); direction = int(last['direction']); close_px = float(last['close'])
+    is_open = symbol_has_open(symbol)
+
+    if is_open:
+        info = get_open_trade_info(symbol)
+        if not info:
+            print(f"[LIVE][DB] sin info de ABIERTA {symbol}"); return
+        _, qty, entry_px, _ = info
+        qty = int(qty) if qty else 0
+        if qty < 1:
+            print(f"[LIVE][DB] qty inválida {symbol}"); return
+        # Stops / salida por señal
+        if _should_stop(symbol, df, float(entry_px)) or (sig == -1) or (direction == 1):
+            c = resolve_contract(symbol)
+            if c is None: return
+            print(f"[LIVE] CLOSE {symbol} x{qty} (stop/signal)")
+            ib.placeOrder(c, MarketOrder('SELL', qty))
+            close_trade_db(symbol, exit_price=close_px, comentario_extra='LIVE stop/signal')
+        else:
+            print(f"[LIVE] HOLD {symbol} | sig={sig} dir={direction}")
+        return
+
+    # Entrada si hay cupo y señal + filtros
+    if open_trades_count() >= MAX_OPEN_TRADES:
+        print(f"[LIVE] Cupo lleno {open_trades_count()}/{MAX_OPEN_TRADES}"); return
+
+    if REQUIRE_MARKET_UPTREND and not market_uptrend_ok():
+        print("[LIVE] Mercado no en uptrend. No nuevas entradas."); return
+
+    ok, why, px = _passes_universe_filters(symbol)
+    if not ok:
+        print(f"[LIVE][SKIP] {symbol}: {why}"); return
+
+    if (sig == 1) or (direction == -1):
+        avail_cash = get_available_funds_usd(); qty = calc_qty_by_cash(px, avail_cash); src='CASH'
+        if qty < 1 and USE_BUYING_POWER:
+            bp = get_buying_power_usd(); qbp = calc_qty_by_bp(px, bp)
+            if qbp >= 1: qty = qbp; src='BP'
+        if qty < 1:
+            print(f"[LIVE] sin saldo para {symbol}"); return
+        c = resolve_contract(symbol)
+        if c is None: return
+        print(f"[LIVE] BUY {symbol} x{qty} ({src})")
+        ib.placeOrder(c, MarketOrder('BUY', qty))
+        insert_trade_open_db(symbol, qty, entry_price=px, comentario='LIVE entry')
+    else:
+        print(f"[LIVE] No-Entry {symbol} | sig={sig} dir={direction}")
+
+# ===================== KILL-SWITCH (DD diario) =====================
+
+def _daily_pnl_estimate() -> float:
+    # Realizado hoy (CERRADA con fecha de hoy)
+    today = datetime.now(timezone.utc).date()
+    cur.execute("""
+        SELECT COALESCE(SUM(pnl),0) FROM operaciones
+        WHERE estado='CERRADA' AND DATE(fecha_cierre) = DATE(?)
+    """, (today.isoformat(),))
+    realized = float(cur.fetchone()[0])
+    # No realizado aprox (open vs entry al último close)
+    cur.execute("SELECT ticker, cantidad, precio_entrada FROM operaciones WHERE estado='ABIERTA'")
+    rows = cur.fetchall()
+    unreal = 0.0
+    for t, q, e in rows:
+        last_px = get_last_close(t)
+        if last_px and q and e:
+            unreal += (last_px - float(e)) * float(q)
+    return realized + unreal
+
+
+def kill_switch_check_and_close_all():
+    nlv = get_net_liq_usd(); limit_dd = -abs(KILL_SWITCH_DD_PCT) * nlv
+    est = _daily_pnl_estimate()
+    if est <= limit_dd:
+        print(f"[KILL-SWITCH] DD estimado {est:.2f} <= {limit_dd:.2f}. Cerrando TODO.")
+        cur.execute("SELECT ticker, cantidad FROM operaciones WHERE estado='ABIERTA'")
+        rows = cur.fetchall()
+        for t, q in rows:
+            try:
+                if not q or int(q) < 1: continue
+                c = resolve_contract(t)
+                if c is None: continue
+                ib.placeOrder(c, MarketOrder('SELL', int(q)))
+                px = get_last_close(t) or 0.0
+                close_trade_db(t, exit_price=px, comentario_extra='KILL-SWITCH')
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"[KILL-SWITCH][{t}] {e}")
+        return True
+    return False
+
+
+
+# ===================== PREFETCH =====================
+
+def prefetch_universe(symbols: list[str], durationStr: str, barSize: str, useRTH: bool):
+    print(f"\n[PREFETCH] Cacheando/actualizando {len(symbols)} símbolos @ {durationStr}/{barSize} ...")
+    ok, fail = 0, 0
+    for s in symbols:
+        try:
+            _ = fetch_history(s, durationStr, barSize, useRTH, use_cache=True, refresh_cache=True)
+            ok += 1
+        except Exception as e:
+            print(f"[PREFETCH][{s}] {e}"); fail += 1
+    print(f"[PREFETCH] OK={ok} | FAIL={fail}\n")
+
+
+# ===================== BACKTEST (por símbolo y cartera) =====================
+
+
+# ===================== BACKTEST (por símbolo y cartera) =====================
+
 def backtest_symbol(symbol):
-    print(f"\n[BT] {symbol} | Descargando {BT_DURATION_STR} @ {TIMEFRAME} ...")
-    df = fetch_history(symbol, BT_DURATION_STR, TIMEFRAME, BT_USE_RTH)
+    print(f"\n[BT] {symbol} | {BT_DURATION_STR} @ {TIMEFRAME} ...")
+    df = fetch_history(symbol, BT_DURATION_STR, TIMEFRAME, BT_USE_RTH, use_cache=True)
     if df is None or len(df) < 50:
         print(f"[BT][WARN] {symbol}: sin datos suficientes.")
         return {'symbol': symbol, 'trades': 0, 'wins': 0, 'wr': 0.0, 'pf': 0.0, 'ret_pct_avg': 0.0, 'pnl': 0.0}
-
-    pos_open = False
-    qty = 0
-    entry_price = None
-    entry_time = None
-    trades = []
-    gross_profit = 0.0
-    gross_loss = 0.0
-
-    # Recorremos hasta len-2 para poder llenar en la vela siguiente (i+1)
-    for i in range(1, len(df) - 1):
-        sig = int(df['signal'].iloc[i])
-        direction = int(df['direction'].iloc[i])
-
-        # ======= ENTRADA (en la apertura de la próxima vela) =======
-        if not pos_open and (sig == 1 or direction == -1):
-            price_next_open = float(df['open'].iloc[i+1])
+    pos_open=False; qty=0; entry_price=None; entry_time=None
+    trades=[]; gp=0.0; gl=0.0
+    for i in range(1, len(df)-1):
+        sig=int(df['signal'].iloc[i]); direction=int(df['direction'].iloc[i])
+        if not pos_open and (sig==1 or direction==-1):
+            price_next_open = float(df['open'].iloc[i+1]) + SLIPPAGE_PER_SH
             budget_eff = max(0.0, BUDGET_PER_TRADE - COMMISSION_OPEN)
             qty = max(1, math.floor(budget_eff / price_next_open))
-            if qty < 1:
-                continue
-            entry_price = price_next_open
-            entry_time  = df['date'].iloc[i+1]
-            pos_open = True
-
-        # ======= SALIDA (en la apertura de la próxima vela) =======
-        elif pos_open and (sig == -1 or direction == 1):
-            exit_price = float(df['open'].iloc[i+1])
-            exit_time  = df['date'].iloc[i+1]
-            pnl = (exit_price - entry_price) * qty
-            ret_pct = (exit_price / entry_price - 1) * 100.0
-            trades.append({'entry_dt': entry_time, 'exit_dt': exit_time,
-                           'entry': entry_price, 'exit': exit_price,
-                           'qty': qty, 'pnl': pnl, 'ret_pct': ret_pct})
-            if pnl >= 0:
-                gross_profit += pnl
-            else:
-                gross_loss += -pnl
-            # Persistimos en DB como CERRADA
-            insert_trade_closed(symbol, qty, entry_price, exit_price, entry_time, exit_time,
-                                comentario='BACKTEST 12M 4H')
-            # reset
-            pos_open = False
-            entry_price = None
-            entry_time = None
-            qty = 0
-
-    # Si quedó abierta, cerramos a close final para contabilizar
+            if qty<1: continue
+            entry_price = price_next_open; entry_time = df['date'].iloc[i+1]; pos_open=True
+        elif pos_open and (sig==-1 or direction==1):
+            exit_price = float(df['open'].iloc[i+1]) + SLIPPAGE_PER_SH
+            pnl = (exit_price - entry_price)*qty - COMMISSION_CLOSE
+            ret = (exit_price/entry_price - 1)*100.0
+            trades.append({'entry_dt':entry_time,'exit_dt':df['date'].iloc[i+1],'entry':entry_price,'exit':exit_price,'qty':qty,'pnl':pnl,'ret_pct':ret})
+            if pnl>=0: gp+=pnl
+            else: gl+=-pnl
+            pos_open=False; qty=0; entry_price=None; entry_time=None
     if pos_open and entry_price is not None:
         exit_price = float(df['close'].iloc[-1])
-        exit_time  = df['date'].iloc[-1]
-        pnl = (exit_price - entry_price) * qty
-        ret_pct = (exit_price / entry_price - 1) * 100.0
-        trades.append({'entry_dt': entry_time, 'exit_dt': exit_time,
-                       'entry': entry_price, 'exit': exit_price,
-                       'qty': qty, 'pnl': pnl, 'ret_pct': ret_pct})
-        if pnl >= 0:
-            gross_profit += pnl
-        else:
-            gross_loss += -pnl
-        insert_trade_closed(symbol, qty, entry_price, exit_price, entry_time, exit_time,
-                            comentario='BACKTEST 12M 4H (forced close)')
+        pnl = (exit_price - entry_price)*qty - COMMISSION_CLOSE
+        ret = (exit_price/entry_price - 1)*100.0
+        trades.append({'entry_dt':entry_time,'exit_dt':df['date'].iloc[-1],'entry':entry_price,'exit':exit_price,'qty':qty,'pnl':pnl,'ret_pct':ret})
+        if pnl>=0: gp+=pnl
+        else: gl+=-pnl
+    n=len(trades); wins=sum(1 for t in trades if t['pnl']>=0)
+    wr=(wins/max(1,n))*100.0; ret_avg=np.mean([t['ret_pct'] for t in trades]) if n else 0.0
+    pf=(gp/gl) if gl>0 else (float('inf') if gp>0 else 0.0); total_pnl=sum(t['pnl'] for t in trades)
+    print(f"[BT] {symbol} → trades={n} | win%={wr:.1f} | pf={pf:.2f} | avg%={ret_avg:.2f} | pnl=${total_pnl:.2f}")
+    return {'symbol':symbol,'trades':n,'wins':wins,'wr':wr,'pf':pf,'ret_pct_avg':ret_avg,'pnl':total_pnl}
 
-    n = len(trades)
-    wins = sum(1 for t in trades if t['pnl'] >= 0)
-    wr = (wins / n * 100.0) if n else 0.0
-    ret_pct_avg = np.mean([t['ret_pct'] for t in trades]) if n else 0.0
-    pf = (gross_profit / gross_loss) if gross_loss > 0 else float('inf') if gross_profit > 0 else 0.0
-    total_pnl = sum(t['pnl'] for t in trades)
 
-    print(f"[BT] {symbol} → trades={n} | win%={wr:.1f} | pf={pf:.2f} | avg%={ret_pct_avg:.2f} | pnl=${total_pnl:.2f}")
-    return {'symbol': symbol, 'trades': n, 'wins': wins, 'wr': wr, 'pf': pf, 'ret_pct_avg': ret_pct_avg, 'pnl': total_pnl}
+def backtest_portfolio(symbols: list[str], durationStr: str, barSize: str, useRTH: bool):
+    print(f"\n=== BACKTEST CARTERA | {durationStr}/{barSize} ===")
 
-# =============== LIVE TRADING (DB-first) ===============
-def analyze_symbol_live(symbol):
-    print(f"\n[LIVE] Analizando {symbol} ...")
-    contract = Stock(symbol, EXCHANGE, CURRENCY)
-
-    # Histórico corto para señal actual
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime='',
-        durationStr='2 M',
-        barSizeSetting=TIMEFRAME,
-        whatToShow='TRADES',
-        useRTH=True,
-        formatDate=1
-    )
-    df = util.df(bars)
-    if df is None or df.empty:
-        print(f"[LIVE][WARN] Sin datos para {symbol}")
+    # --- Carga de datos ---
+    data = {}
+    for s in symbols:
+        df = fetch_history(s, durationStr, barSize, useRTH, use_cache=True)
+        if df is None or len(df) < RS_LOOKBACK_BARS + 5:
+            continue
+        df = df.drop_duplicates('date').reset_index(drop=True)
+        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
+        data[s] = df
+    if not data:
+        print("[PORT] Sin datos válidos.")
         return
 
-    df.drop_duplicates(subset=['date'], inplace=True)
-    df.sort_values(by='date', inplace=True, ignore_index=True)
-    df['src'] = (df['high'] + df['low']) / 2.0 if PRICE_SOURCE.lower() == 'hl2' else df['close']
-    df['kalman_hma'] = khma(df['src'], MEASUREMENT_NOISE, PROCESS_NOISE)
-    df = supertrend_backquant(df, factor=ATR_FACTOR, atr_period=ATR_PERIOD, src_col='kalman_hma')
-    df['signal'] = 0
-    cross_long  = (df['direction'].shift(1) > 0) & (df['direction'] < 0)
-    cross_short = (df['direction'].shift(1) < 0) & (df['direction'] > 0)
-    df.loc[cross_long, 'signal'] = 1
-    df.loc[cross_short, 'signal'] = -1
+    print(f"[PORT] Símbolos cargados: {len(data)} / {len(symbols)}")
 
-    latest = df.iloc[-1]
-    sig = int(latest['signal'])
-    direction = int(latest['direction'])
-    close_px = float(latest['close'])
+    # --- Inicialización ---
+    cash = BT_STARTING_CASH
+    positions = {}
+    closed = []
 
-    if MODE_N == "BACKTEST":
-        print("[SAFEGUARD] BACKTEST activo: no se envían órdenes.")
+    # --- Loop principal (día a día sincronizado por fecha mínima común) ---
+    # Crear set de fechas comunes entre todos los símbolos
+    all_dates = sorted(set().union(*[set(df['date']) for df in data.values()]))
+
+    for i in range(1, len(all_dates)):
+        t_prev, t = all_dates[i - 1], all_dates[i]
+
+        # === Cierres ===
+        for s, pos in list(positions.items()):
+            df = data[s]
+            if t not in set(df['date']):
+                continue
+            k = df.index[df['date'] == t_prev]
+            k1 = df.index[df['date'] == t]
+            if len(k) == 0 or len(k1) == 0:
+                continue
+            k, k1 = k[0], k1[0]
+
+            # cerrar si hay señal de salida
+            if df.loc[k, 'signal'] == -1:
+                exit_px = float(df.loc[k1, 'open']) + SLIPPAGE_PER_SH
+                pnl = (exit_px - pos['entry_px']) * pos['qty'] - COMMISSION_CLOSE
+                cash += exit_px * pos['qty']
+                closed.append({
+                    'symbol': s,
+                    'entry_px': pos['entry_px'],
+                    'exit_px': exit_px,
+                    'qty': pos['qty'],
+                    'entry_dt': pos['entry_dt'],
+                    'exit_dt': df.loc[k1, 'date'],
+                    'pnl': pnl
+                })
+                print(f"[PORT][CLOSE] {s} x{pos['qty']} @ {exit_px:.2f} | pnl=${pnl:.2f} | cash=${cash:.2f}")
+                del positions[s]
+
+        # === Entradas ===
+        free_slots = max(0, MAX_OPEN_TRADES - len(positions))
+        if free_slots <= 0:
+            continue
+
+        candidates = []
+        for s, df in data.items():
+            if s in positions:
+                continue
+            if t not in set(df['date']):
+                continue
+            k = df.index[df['date'] == t_prev]
+            k1 = df.index[df['date'] == t]
+            if len(k) == 0 or len(k1) == 0:
+                continue
+            k, k1 = k[0], k1[0]
+            sig = df.loc[k, 'signal']
+            rs = df.loc[k, 'rs'] if 'rs' in df.columns else 0.5
+            if sig != 1 or rs < RS_MIN:
+                continue
+            price = float(df.loc[k1, 'open'])
+            eff = max(0.0, BUDGET_PER_TRADE - COMMISSION_OPEN)
+            q = math.floor(eff / (price + SLIPPAGE_PER_SH))
+            if q < 1 or (price * q) > cash:
+                continue
+            candidates.append((s, rs, price, k1, q))
+
+        # Ordenar por RS descendente
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        for s, rs, px, k1, q in candidates[:free_slots]:
+            notional = px * q + COMMISSION_OPEN + SLIPPAGE_PER_SH * q
+            if notional > cash:
+                continue
+            cash -= notional
+            df = data[s]
+            positions[s] = {'qty': q, 'entry_px': px + SLIPPAGE_PER_SH, 'entry_dt': df.loc[k1, 'date']}
+            print(f"[PORT][BUY] {s} x{q} @ {px:.2f} | RS={rs:.3f} | cash=${cash:.2f}")
+
+    # === Cierre forzado ===
+    for s, pos in list(positions.items()):
+        df = data[s]
+        px = float(df.iloc[-1]['close'])
+        pnl = (px - pos['entry_px']) * pos['qty'] - COMMISSION_CLOSE
+        cash += px * pos['qty']
+        closed.append({
+            'symbol': s,
+            'entry_px': pos['entry_px'],
+            'exit_px': px,
+            'qty': pos['qty'],
+            'entry_dt': pos['entry_dt'],
+            'exit_dt': df.iloc[-1]['date'],
+            'pnl': pnl
+        })
+        print(f"[PORT][FORCED CLOSE] {s} @ {px:.2f} | pnl=${pnl:.2f} | cash=${cash:.2f}")
+        del positions[s]
+
+    # === Resultados ===
+    if not closed:
+        print("[PORT] Sin operaciones (sin señales).")
         return
 
-    # ======== Estado DB ========
-    is_open = symbol_has_open(symbol)
+    dft = pd.DataFrame(closed)
+    total = dft['pnl'].sum()
+    wr = 100.0 * (dft['pnl'] >= 0).mean()
+    pf = (dft.loc[dft['pnl'] > 0, 'pnl'].sum() /
+          max(1e-9, -dft.loc[dft['pnl'] < 0, 'pnl'].sum()))
+    print(f"\n[PORT] Operaciones={len(dft)} | Win%={wr:.1f} | PF={pf:.2f} | PnL=${total:.2f} | Cash=${cash:.2f}")
 
-    # ======== CIERRE si está ABIERTA en DB ========
-    if is_open:
-        # Criterio de salida: señal opuesta o cambio de dirección a bajista (direction == 1)
-        if (sig == -1) or (direction == 1):
-            info = get_open_trade_info(symbol)
-            if not info:
-                print(f"[LIVE][DB] No pude leer qty abierto de DB para {symbol}.")
-                return
-            _, qty_open, entry_px, _ = info
-            qty_exit = int(qty_open) if qty_open else 0
-            if qty_exit < 1:
-                print(f"[LIVE] {symbol}: qty DB inválida ({qty_exit}). No cierro.")
-                return
-            print(f"[LIVE] CLOSE LONG {symbol} x{qty_exit}")
-            ib.placeOrder(contract, MarketOrder('SELL', qty_exit))
-            # Marcar cierre en DB con el precio de mercado actual (aprox)
-            close_trade_db(symbol, exit_price=close_px, comentario_extra='LIVE close by signal')
-        else:
-            print(f"[LIVE] HOLD {symbol} (ABIERTA en DB) | Señal={sig} | Dir={direction}")
-        return  # Importante: no evaluar entrada si ya está ABIERTA
+    print("\nTop PnL por símbolo:")
+    for sym, val in dft.groupby('symbol')['pnl'].sum().sort_values(ascending=False).head(15).items():
+        print(f" {sym:<6}  ${val:,.2f}")
 
-    # ======== ENTRADA solo si NO está ABIERTA y hay cupo (DB) ========
-    current_open = open_trades_count()
-    if current_open >= MAX_OPEN_TRADES:
-        print(f"[LIVE] Cupo lleno ({current_open}/{MAX_OPEN_TRADES}). Sin nuevas entradas en {symbol}.")
-        return
-
-    if (sig == 1) or (direction == -1):
-        # Sizing por CASH con fallback a BP
-        avail_cash = get_available_funds_usd()
-        qty = calc_qty_by_cash(close_px, avail_cash)
-        sizing_src = "CASH"
-
-        if qty < 1 and USE_BUYING_POWER:
-            bp = get_buying_power_usd()
-            qty_bp = calc_qty_by_bp(close_px, bp)
-            if qty_bp >= 1:
-                qty = qty_bp
-                sizing_src = "BP"
-
-        if qty < 1:
-            print(f"[LIVE] {symbol}: sin saldo suficiente. No entro.")
-            return
-
-        notional = qty * close_px
-        if sizing_src == "CASH":
-            print(f"[LIVE] BUY {symbol} x{qty} ~${notional:.2f} (CASH)")
-        else:
-            print(f"[LIVE] BUY {symbol} x{qty} ~${notional:.2f} (via BUYING POWER)")
-        ib.placeOrder(contract, MarketOrder('BUY', qty))
-
-        # Registrar ABIERTA en DB
-        insert_trade_open_db(symbol, qty, entry_price=close_px, comentario='LIVE entry')
-    else:
-        print(f"[LIVE] No-Entry {symbol} | Señal={sig} | Dir={direction}")
-
-# =============== MAIN LOOP ===============
+# ===================== MAIN =====================
 if __name__ == '__main__':
     if MODE_N == "BACKTEST":
-        results = []
-        for sym in SYMBOLS:
+        if ENABLE_PREFETCH: prefetch_universe(SYMBOLS, BT_DURATION_STR, TIMEFRAME, BT_USE_RTH)
+        results=[]
+        for s in SYMBOLS:
             try:
-                res = backtest_symbol(sym)
-                results.append(res)
-                time.sleep(0.3)  # pacing
+                results.append(backtest_symbol(s)); time.sleep(PACING_SECONDS)
             except Exception as e:
-                print(f"[BT][ERROR] {sym}: {e}")
+                print(f"[BT][ERROR] {s}: {e}")
+        if RUN_PORTFOLIO_BT:
+            backtest_portfolio(SYMBOLS, BT_DURATION_STR, TIMEFRAME, BT_USE_RTH)
 
-        # Resumen global
-        if results:
-            df_res = pd.DataFrame(results).sort_values('pnl', ascending=False)
-            total_trades = int(df_res['trades'].sum())
-            win_rate_avg = (df_res['wins'].sum() / max(1, total_trades)) * 100.0
-            profit_factor_med = df_res.replace([np.inf, -np.inf], np.nan)['pf'].median(skipna=True)
-            total_pnl = df_res['pnl'].sum()
-            print(f"\n========== RESUMEN BACKTEST {BT_DURATION_STR} / {TIMEFRAME} ==========")
-            print(df_res[['symbol','trades','wr','pf','ret_pct_avg','pnl']].to_string(index=False, formatters={
-                'wr': lambda x: f"{x:.1f}",
-                'pf': lambda x: f"{x:.2f}" if np.isfinite(x) else "inf",
-                'ret_pct_avg': lambda x: f"{x:.2f}",
-                'pnl': lambda x: f"${x:.2f}"
-            }))
-            print("----------------------------------------------")
-            print(f"TOTAL trades: {total_trades} | Win% global: {win_rate_avg:.1f} | PF mediano: {profit_factor_med:.2f} | PnL total: ${total_pnl:.2f}")
-    elif MODE_N == "LIVE":
-    # LIVE
-        while True:
-            print("\n========== NUEVA ITERACIÓN (LIVE) ==========")
-
-            # Intentar reconexión si se cortó IBKR
+    elif MODE_N == "PREOPEN":
+        try:
             ensure_ib_connection()
+            if ENABLE_PREFETCH:
+                # Calienta cache sólo con diaria (rápido y suficiente para PREOPEN)
+                prefetch_universe(SYMBOLS, '2 M', TIMEFRAME, True)
+            queue_orders_for_next_open()
+        finally:
+            try: ib.disconnect()
+            except Exception: pass
 
-            # Si el mercado está cerrado, saltar iteración
+    elif MODE_N == "LIVE":
+    # Reconciliar fills (por ejemplo, tras un PREOPEN anterior)
+        preopen_done_date = None  # fecha ET para no duplicar PREOPEN
+        reconciled_for_open = False
+
+        reconcile_fills_update_db()
+        while True:
+            print(f"\n========== NUEVA ITERACIÓN (LIVE) [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ==========")
+            ensure_ib_connection()
+            if kill_switch_check_and_close_all():
+                print("[LIVE] Kill-switch activado. Pausando 1h."); time.sleep(3600); continue
+
+            now_et = datetime.now(pytz.timezone('US/Eastern'))
             if not market_is_open():
-                print("[LIVE] Mercado cerrado, esperando próxima ventana (9:30–16:00 EST).")
-                time.sleep(60 * 60)  # duerme 1h antes de revisar de nuevo
-                continue
+                # Ejecuta PREOPEN una única vez por día ET y espera apertura
+                if preopen_done_date != now_et.date():
+                    print(f"[LIVE] Mercado cerrado. Ejecutando PREOPEN único para {now_et.date()}...")
+                    try:
+                        if ENABLE_PREFETCH:
+                            prefetch_universe(SYMBOLS, '2 M', TIMEFRAME, True)
+                        queue_orders_for_next_open()
+                        preopen_done_date = now_et.date()
+                    except Exception as e:
+                        print(f"[LIVE][PREOPEN][ERROR] {e}")
+                else:
+                    print(f"[LIVE] Mercado cerrado (PREOPEN ya ejecutado para {preopen_done_date}).")
+                reconciled_for_open = False  # forzar reconcile al abrir
+                print("[LIVE] Espera 15m..."); time.sleep(900); continue
 
-            # 1) Revisar y gestionar PRIMERO los que ya están ABIERTOS en DB
-            open_syms = sorted(get_open_symbols_db())
-            if open_syms:
-                print(f"[LIVE][DB] Abiertos actuales: {open_syms}")
-            for sym in open_syms:
-                try:
-                    analyze_symbol_live(sym)
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"[LIVE][ERROR exit-check] {sym}: {e}")
+            # Mercado ABIERTO → reconcile una vez post-apertura
+            if not reconciled_for_open:
+                print("[LIVE] Apertura detectada. Reconciliando fills de OPG...")
+                reconcile_fills_update_db()
+                reconciled_for_open = True
 
-            # 2) Si hay cupo, buscar ENTRADAS en el resto (excluye los ya abiertos en DB)
-            #    Ordenados por RS20
+            # Gestionar abiertos primero
+            open_syms = [s for s in get_open_symbols_db()]
+            if open_syms: print(f"[LIVE][DB] Abiertos: {open_syms}")
+            for s in open_syms:
+                try: analyze_symbol_live(s); time.sleep(1)
+                except Exception as e: print(f"[LIVE][ERR exit-check] {s}: {e}")
+
+            # Buscar entradas si hay cupo (filtros + ranking RS)
             if open_trades_count() < MAX_OPEN_TRADES:
                 base = [s for s in SYMBOLS if s not in open_syms]
-                ranked_syms = rank_candidates_rs20(base, TIMEFRAME)
-                print(f"[LIVE][RANK_RS20] Orden de prioridad: {ranked_syms}")
-                for sym in ranked_syms:
-                    if open_trades_count() >= MAX_OPEN_TRADES:
-                        break
-                    try:
-                        analyze_symbol_live(sym)
-                        time.sleep(1)
-                    except Exception as e:
-                        print(f"[LIVE][ERROR entry-check] {sym}: {e}")
+                filt = [s for s in base if _passes_universe_filters(s)[0]]
+                ranked = rank_candidates_rs20(filt, TIMEFRAME)
+                print(f"[LIVE][RS20] prioridad: {ranked[:15]} ...")
+                for s in ranked:
+                    if open_trades_count() >= MAX_OPEN_TRADES: break
+                    try: analyze_symbol_live(s); time.sleep(1)
+                    except Exception as e: print(f"[LIVE][ERR entry-check] {s}: {e}")
             else:
-                print(f"[LIVE] Cupo completo: {open_trades_count()}/{MAX_OPEN_TRADES}")
+                print(f"[LIVE] Cupo completo {open_trades_count()}/{MAX_OPEN_TRADES}")
 
-            print("\nEsperando próxima revisión (30m)...\n")
-            ib.sleep(60 * 30)  # cada 30 minutos
+            print("\nEsperando próxima revisión (15m) ...\n"); ib.sleep(60*15)
 
