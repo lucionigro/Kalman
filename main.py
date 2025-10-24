@@ -146,6 +146,7 @@ conn.commit()
 # ===================== CONEXIÓN IBKR =====================
 ib = IB()
 ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
+resync_from_ibkr()
 print(f"Conectado a IBKR | MODE={MODE}")
 
 # ===================== HELPERS IBKR / CONTRATOS =====================
@@ -212,6 +213,19 @@ def true_range(df):
     tr2 = (df['high'] - prev_close).abs()
     tr3 = (df['low'] - df['close'].shift(1)).abs()
     return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+def resync_from_ibkr():
+    print(f"VERIFICANDO POSICIONES EN IBKR")
+    for p in ib.positions():
+        sym = p.contract.symbol
+        qty = int(p.position)
+        if qty == 0:
+            continue
+        avg_cost = float(p.avgCost)
+        if not symbol_has_open(sym):
+            insert_trade_open_db(sym, qty, avg_cost, comentario='Resync from IBKR')
+            print(f"[RESYNC] {sym} x{qty} @ {avg_cost:.2f}")
+
 
 def supertrend_backquant(df, factor=1.5, atr_period=14, src_col="kalman_hma"):
     df['tr'] = true_range(df)
@@ -684,31 +698,92 @@ def queue_orders_for_next_open():
 
 # ===================== RECONCILIAR FILLS (LIVE) =====================
 def reconcile_fills_update_db():
+    """
+    Sincroniza los fills ejecutados en IBKR con la base local:
+      - Actualiza precios de entrada si hubo BUY fills.
+      - Cierra operaciones ABIERTAS si se detecta una venta total.
+      - Reduce cantidad si se trata de una venta parcial.
+      - Marca comentarios claros ('STOP BE fill', 'SELL parcial fill').
+    """
     try:
-        fills = ib.fills()  # lista de Fill objects
+        fills = ib.fills()  # lista de Fill objects recientes
     except Exception as e:
         print(f"[RECONCILE][WARN] {e}")
         return
+
     if not fills:
         print("[RECONCILE] Sin fills para actualizar.")
         return
-    updated = 0
+
+    updated_entry = 0
+    closed_total = 0
+    closed_partial = 0
+
     for f in fills:
         try:
             sym = f.contract.symbol
             avg = float(f.execution.avgPrice or f.execution.price)
             side = f.execution.side.upper()
-            # Si es BUY y tenemos ABIERTA con precio_entrada ~ cierre (PREOPEN), actualizar
-            if side == 'BOT' or side == 'BUY':
+            shares = int(abs(f.execution.shares))
+            fill_time = f.execution.time
+
+            # === Actualización de BUY / entrada ===
+            if side in ('BOT', 'BUY'):
                 row = get_open_trade_info(sym)
                 if row:
                     op_id, qty, entry_price, _ = row
                     if entry_price is not None and abs(avg - float(entry_price)) > 1e-6:
                         cur.execute("UPDATE operaciones SET precio_entrada=? WHERE id=?", (avg, op_id))
-                        conn.commit(); updated += 1
-        except Exception:
-            pass
-    print(f"[RECONCILE] Entradas actualizadas con avgFillPrice: {updated}")
+                        conn.commit()
+                        updated_entry += 1
+                        print(f"[RECONCILE][BUY] {sym} actualizado entry @ {avg:.2f}")
+
+            # === Manejo de ventas / stops ===
+            if side in ('SLD', 'SELL'):
+                cur.execute("""
+                    SELECT id, cantidad, precio_entrada
+                    FROM operaciones
+                    WHERE ticker=? AND estado='ABIERTA'
+                """, (sym,))
+                row = cur.fetchone()
+                if not row:
+                    continue
+
+                op_id, qty_db, entry_px = row
+                qty_db = int(qty_db or 0)
+                if qty_db <= 0:
+                    continue
+
+                if shares >= qty_db:
+                    # 🟥 Venta total → cerrar operación
+                    cur.execute("""
+                        UPDATE operaciones
+                        SET precio_salida=?, fecha_cierre=datetime('now'),
+                            estado='CERRADA',
+                            comentario=COALESCE(comentario,'') || ' | STOP BE fill'
+                        WHERE id=?
+                    """, (avg, op_id))
+                    conn.commit()
+                    closed_total += 1
+                    print(f"[RECONCILE][STOP] {sym} cerrado totalmente @ {avg:.2f}")
+                else:
+                    # 🟨 Venta parcial → actualizar cantidad restante
+                    nueva_cant = qty_db - shares
+                    cur.execute("""
+                        UPDATE operaciones
+                        SET cantidad=?,
+                            comentario=COALESCE(comentario,'') || ' | SELL parcial fill'
+                        WHERE id=?
+                    """, (nueva_cant, op_id))
+                    conn.commit()
+                    closed_partial += 1
+                    print(f"[RECONCILE][PARTIAL] {sym} venta parcial ({shares}/{qty_db}) @ {avg:.2f} → quedan {nueva_cant}")
+
+        except Exception as e:
+            print(f"[RECONCILE][ERROR] {e}")
+
+    print(f"[RECONCILE] Entradas actualizadas: {updated_entry} | Cierres totales: {closed_total} | Parciales: {closed_partial}")
+
 
 # ===================== STOPS / LIVE ANALYSIS =====================
 
@@ -734,54 +809,93 @@ def analyze_symbol_live(symbol):
     if df is None or df.empty:
         print(f"[LIVE][WARN] Sin datos {symbol}")
         return
+
     last = df.iloc[-1]
-    sig = int(last['signal']); direction = int(last['direction']); close_px = float(last['close'])
+    sig = int(last['signal'])
+    direction = int(last['direction'])
+    close_px = float(last['close'])
     is_open = symbol_has_open(symbol)
 
+    # =============== POSICIONES ABIERTAS ===============
     if is_open:
         info = get_open_trade_info(symbol)
         if not info:
-            print(f"[LIVE][DB] sin info de ABIERTA {symbol}"); return
+            print(f"[LIVE][DB] sin info de ABIERTA {symbol}")
+            return
         _, qty, entry_px, _ = info
         qty = int(qty) if qty else 0
         if qty < 1:
-            print(f"[LIVE][DB] qty inválida {symbol}"); return
-        # Stops / salida por señal
+            print(f"[LIVE][DB] qty inválida {symbol}")
+            return
+
+        gain_pct = (close_px / float(entry_px) - 1.0) * 100.0
+
+        # 🟢 Take Profit parcial al +8% y Stop BE
+        if gain_pct >= 8.0 and qty > 1:
+            half_qty = qty // 2
+            remaining_qty = qty - half_qty
+            c = resolve_contract(symbol)
+            if c:
+                print(f"[LIVE][TP] {symbol}: +{gain_pct:.2f}% → vendiendo {half_qty} y colocando stop BE")
+                # 1️⃣ Vende mitad
+                ib.placeOrder(c, MarketOrder('SELL', half_qty))
+                close_trade_db(symbol, exit_price=close_px, comentario_extra='TP parcial 8%')
+                # 2️⃣ Reinsertar la mitad restante
+                insert_trade_open_db(symbol, remaining_qty, entry_price=float(entry_px), comentario='Reentry BE')
+                # 3️⃣ Colocar Stop en Break-Even
+                stop_order = StopOrder('SELL', remaining_qty, stopPrice=float(entry_px))
+                ib.placeOrder(c, stop_order)
+                print(f"[LIVE][STOP] Stop BE colocado @ {entry_px:.2f} por {remaining_qty} acciones")
+            return  # corta acá si hubo TP parcial
+
+        # 🔴 Stop o señal opuesta (evaluado siempre)
         if _should_stop(symbol, df, float(entry_px)) or (sig == -1) or (direction == 1):
             c = resolve_contract(symbol)
-            if c is None: return
+            if c is None:
+                return
             print(f"[LIVE] CLOSE {symbol} x{qty} (stop/signal)")
             ib.placeOrder(c, MarketOrder('SELL', qty))
             close_trade_db(symbol, exit_price=close_px, comentario_extra='LIVE stop/signal')
         else:
-            print(f"[LIVE] HOLD {symbol} | sig={sig} dir={direction}")
+            print(f"[LIVE] HOLD {symbol} | sig={sig} dir={direction} | +{gain_pct:.2f}%")
         return
 
-    # Entrada si hay cupo y señal + filtros
+    # =============== ENTRADAS NUEVAS ===============
     if open_trades_count() >= MAX_OPEN_TRADES:
-        print(f"[LIVE] Cupo lleno {open_trades_count()}/{MAX_OPEN_TRADES}"); return
+        print(f"[LIVE] Cupo lleno {open_trades_count()}/{MAX_OPEN_TRADES}")
+        return
 
     if REQUIRE_MARKET_UPTREND and not market_uptrend_ok():
-        print("[LIVE] Mercado no en uptrend. No nuevas entradas."); return
+        print("[LIVE] Mercado no en uptrend. No nuevas entradas.")
+        return
 
     ok, why, px = _passes_universe_filters(symbol)
     if not ok:
-        print(f"[LIVE][SKIP] {symbol}: {why}"); return
+        print(f"[LIVE][SKIP] {symbol}: {why}")
+        return
 
     if (sig == 1) or (direction == -1):
-        avail_cash = get_available_funds_usd(); qty = calc_qty_by_cash(px, avail_cash); src='CASH'
+        avail_cash = get_available_funds_usd()
+        qty = calc_qty_by_cash(px, avail_cash)
+        src = 'CASH'
         if qty < 1 and USE_BUYING_POWER:
-            bp = get_buying_power_usd(); qbp = calc_qty_by_bp(px, bp)
-            if qbp >= 1: qty = qbp; src='BP'
+            bp = get_buying_power_usd()
+            qbp = calc_qty_by_bp(px, bp)
+            if qbp >= 1:
+                qty = qbp
+                src = 'BP'
         if qty < 1:
-            print(f"[LIVE] sin saldo para {symbol}"); return
+            print(f"[LIVE] sin saldo para {symbol}")
+            return
         c = resolve_contract(symbol)
-        if c is None: return
+        if c is None:
+            return
         print(f"[LIVE] BUY {symbol} x{qty} ({src})")
         ib.placeOrder(c, MarketOrder('BUY', qty))
         insert_trade_open_db(symbol, qty, entry_price=px, comentario='LIVE entry')
     else:
         print(f"[LIVE] No-Entry {symbol} | sig={sig} dir={direction}")
+
 
 # ===================== KILL-SWITCH (DD diario) =====================
 
