@@ -146,7 +146,6 @@ conn.commit()
 # ===================== CONEXIÓN IBKR =====================
 ib = IB()
 ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
-resync_from_ibkr()
 print(f"Conectado a IBKR | MODE={MODE}")
 
 # ===================== HELPERS IBKR / CONTRATOS =====================
@@ -696,6 +695,39 @@ def queue_orders_for_next_open():
         elif VERBOSE_PREOPEN:
             print(f"[PREOPEN][NO-ENTRY] {sym}: sig={sig} dir={direction}")
 
+
+def reconcile_positions_vs_ibkr():
+        """
+        Compara las posiciones abiertas en IBKR con las operaciones marcadas como ABIERTAS en la base local.
+        Si detecta un símbolo abierto en DB pero no presente en IBKR, marca la operación como CERRADA.
+        """
+        try:
+            # 1️⃣ Posiciones reales en IBKR
+            ib_positions = {pos.contract.symbol: pos.position for pos in ib.positions()}
+
+            # 2️⃣ Posiciones abiertas según la base local
+            cur.execute("SELECT ticker, precio_entrada FROM operaciones WHERE estado='ABIERTA'")
+            db_open = cur.fetchall()
+
+            closed_count = 0
+
+            for sym, entry_px in db_open:
+                ib_qty = ib_positions.get(sym, 0)
+                if ib_qty == 0:
+                    # Ya no existe posición en IBKR → cerramos en DB
+                    last_px = get_last_close(sym)
+                    close_trade_db(sym, exit_price=last_px, comentario_extra='Sync auto IBKR')
+                    closed_count += 1
+                    print(f"[SYNC] {sym}: no aparece en IBKR, cerrado localmente (sync).")
+
+            if closed_count > 0:
+                print(f"[SYNC] {closed_count} operaciones cerradas por reconciliación IBKR.")
+            else:
+                print("[SYNC] DB e IBKR sincronizados.")
+
+        except Exception as e:
+            print(f"[SYNC][ERROR] {e}")
+
 # ===================== RECONCILIAR FILLS (LIVE) =====================
 def reconcile_fills_update_db():
     """
@@ -785,6 +817,10 @@ def reconcile_fills_update_db():
     print(f"[RECONCILE] Entradas actualizadas: {updated_entry} | Cierres totales: {closed_total} | Parciales: {closed_partial}")
 
 
+    
+
+
+
 # ===================== STOPS / LIVE ANALYSIS =====================
 
 def _should_stop(symbol: str, df: pd.DataFrame, entry_px: float) -> bool:
@@ -830,22 +866,45 @@ def analyze_symbol_live(symbol):
 
         gain_pct = (close_px / float(entry_px) - 1.0) * 100.0
 
-        # 🟢 Take Profit parcial al +8% y Stop BE
-        if gain_pct >= 8.0 and qty > 1:
+        # 🔍 Detectar si ya se hizo un TP parcial (según comentario en DB)
+        tp_done = False
+        cur.execute("""
+            SELECT comentario FROM operaciones
+            WHERE ticker=? AND estado='ABIERTA'
+        """, (symbol,))
+        row = cur.fetchone()
+        if row and row[0] and 'TP parcial 8%' in row[0]:
+            tp_done = True
+
+        # 🟢 Take Profit parcial único al +8% y Stop BE (solo si no se hizo antes)
+        if not tp_done and gain_pct >= 8.0 and qty > 1:
             half_qty = qty // 2
             remaining_qty = qty - half_qty
             c = resolve_contract(symbol)
             if c:
                 print(f"[LIVE][TP] {symbol}: +{gain_pct:.2f}% → vendiendo {half_qty} y colocando stop BE")
+
                 # 1️⃣ Vende mitad
                 ib.placeOrder(c, MarketOrder('SELL', half_qty))
                 close_trade_db(symbol, exit_price=close_px, comentario_extra='TP parcial 8%')
-                # 2️⃣ Reinsertar la mitad restante
-                insert_trade_open_db(symbol, remaining_qty, entry_price=float(entry_px), comentario='Reentry BE')
-                # 3️⃣ Colocar Stop en Break-Even
+
+                # 2️⃣ Reinsertar la mitad restante y marcar TP parcial hecho
+                insert_trade_open_db(symbol, remaining_qty, entry_price=float(entry_px),
+                                    comentario='Reentry BE | TP parcial 8%')
+
+                # 🚫 Cancelar stops previos activos antes de colocar uno nuevo
+                open_orders = ib.openOrders()
+                for o in open_orders:
+                    if o.contract.symbol == symbol and o.action == 'SELL' and o.orderType == 'STP':
+                        print(f"[LIVE][CANCEL] Cancelando stop previo de {symbol}")
+                        ib.cancelOrder(o)
+
+                # 3️⃣ Colocar nuevo Stop en Break-Even (GTC)
                 stop_order = StopOrder('SELL', remaining_qty, stopPrice=float(entry_px))
+                stop_order.tif = 'GTC'  # ✅ mantiene la orden activa overnight
                 ib.placeOrder(c, stop_order)
                 print(f"[LIVE][STOP] Stop BE colocado @ {entry_px:.2f} por {remaining_qty} acciones")
+
             return  # corta acá si hubo TP parcial
 
         # 🔴 Stop o señal opuesta (evaluado siempre)
@@ -859,6 +918,7 @@ def analyze_symbol_live(symbol):
         else:
             print(f"[LIVE] HOLD {symbol} | sig={sig} dir={direction} | +{gain_pct:.2f}%")
         return
+
 
     # =============== ENTRADAS NUEVAS ===============
     if open_trades_count() >= MAX_OPEN_TRADES:
@@ -1157,11 +1217,14 @@ if __name__ == '__main__':
     # Reconciliar fills (por ejemplo, tras un PREOPEN anterior)
         preopen_done_date = None  # fecha ET para no duplicar PREOPEN
         reconciled_for_open = False
-
+        resync_from_ibkr()
         reconcile_fills_update_db()
         while True:
             print(f"\n========== NUEVA ITERACIÓN (LIVE) [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ==========")
             ensure_ib_connection()
+
+            reconcile_fills_update_db()
+
             if kill_switch_check_and_close_all():
                 print("[LIVE] Kill-switch activado. Pausando 1h."); time.sleep(3600); continue
 
@@ -1181,12 +1244,6 @@ if __name__ == '__main__':
                     print(f"[LIVE] Mercado cerrado (PREOPEN ya ejecutado para {preopen_done_date}).")
                 reconciled_for_open = False  # forzar reconcile al abrir
                 print("[LIVE] Espera 15m..."); time.sleep(900); continue
-
-            # Mercado ABIERTO → reconcile una vez post-apertura
-            if not reconciled_for_open:
-                print("[LIVE] Apertura detectada. Reconciliando fills de OPG...")
-                reconcile_fills_update_db()
-                reconciled_for_open = True
 
             # Gestionar abiertos primero
             open_syms = [s for s in get_open_symbols_db()]
@@ -1208,5 +1265,6 @@ if __name__ == '__main__':
             else:
                 print(f"[LIVE] Cupo completo {open_trades_count()}/{MAX_OPEN_TRADES}")
 
+            reconcile_positions_vs_ibkr()
             print("\nEsperando próxima revisión (15m) ...\n"); ib.sleep(60*15)
 
