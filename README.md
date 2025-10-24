@@ -62,7 +62,7 @@ if gain_pct >= 8.0 and qty > 1:
     insert_trade_open_db(symbol, remaining_qty, entry_price=entry_px, comentario='Reentry BE')
     stop_order = StopOrder('SELL', remaining_qty, stopPrice=entry_px)
     ib.placeOrder(c, stop_order)
-💡 Resultado: si el precio cae luego del +8 %, se protege el capital sin perder la ganancia ya realizada.
+💡 Resultado: si el precio cae luego del +8 %, se protege el capital sin perder la ganancia ya realizada. ´´´
 
 🧮 Reconciliación automática de fills
 Función: reconcile_fills_update_db()
@@ -101,8 +101,6 @@ Actualiza DB y duerme 15 minutos.
 🧱 Persistencia y estructura de datos
 SQLite (trades.db) con tabla:
 
-sql
-Copiar código
 CREATE TABLE operaciones (
     id INTEGER PRIMARY KEY,
     ticker TEXT,
@@ -118,7 +116,7 @@ CREATE TABLE operaciones (
     duracion_horas REAL,
     estrategia TEXT,
     comentario TEXT
-);
+); 
 Cada registro representa una operación (abierta o cerrada).
 Se mantiene un índice único (ticker, estado='ABIERTA').
 
