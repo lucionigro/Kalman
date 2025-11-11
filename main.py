@@ -92,6 +92,8 @@ RESERVE_CASH_PCT    = 0.00
 USE_BUYING_POWER    = False
 BP_TRADE_CAP        = 1800.0
 BP_RESERVE_PCT      = 0.10
+COMMISSION_OPEN = 1.0         # comisión de apertura por operación
+SLIPPAGE_PER_SH = 0.02        # slippage estimado por acción
 
 USE_LOO             = True       # True=Limit-On-Open, False=Market-On-Open
 LOO_BAND_PCT_BUY    = 0.05       # BUY hasta +5% del cierre
@@ -99,7 +101,7 @@ LOO_BAND_PCT_SELL   = 0.05       # SELL hasta -5% del cierre
 
 STOP_ATR_MULT       = 2.5        # trailing con ATR*mult (apoya al Supertrend)
 MAX_LOSS_PCT        = 0.05       # hard stop vs entry
-KILL_SWITCH_DD_PCT  = 0.02       # cierra todo si DD estimado del día <-2% del NLV
+KILL_SWITCH_DD_PCT  = 0.05       # cierra todo si DD estimado del día <-2% del NLV
 
 MIN_PRICE           = 5.0       # filtro universo: precio mínimo
 ADV_MIN_USD         = 25_000_000 # filtro universo: dólar volumen promedio (≈20 días)
@@ -109,16 +111,6 @@ EARNINGS_DAYS_WINDOW   = 3       # excluir ±3 días de earnings
 
 REQUIRE_MARKET_UPTREND = True    # filtra entradas long si mercado bajista
 SMA_UPTREND_LEN        =  50
-
-# ===================== BACKTEST =====================
-BT_DURATION_STR   = '2 Y'
-BT_USE_RTH        = True
-COMMISSION_OPEN   = 1.0
-COMMISSION_CLOSE  = 1.0
-SLIPPAGE_PER_SH   = 0.02
-RUN_PORTFOLIO_BT  = True
-BT_STARTING_CASH  = 4_000.0
-
 
 # ===================== CACHE =====================
 CACHE_DIR = 'data_cache'
@@ -934,7 +926,23 @@ def analyze_symbol_live(symbol):
     last = df.iloc[-1]
     sig = int(last['signal'])
     direction = int(last['direction'])
+
+    # 🔹 Precio base de cierre (por fallback)
     close_px = float(last['close'])
+
+    # 🔹 Intentar usar precio real de IBKR
+    try:
+        contract = resolve_contract(symbol)
+        if contract:
+            ticker = ib.reqMktData(contract, '', False, False)
+            ib.sleep(1.0)  # espera leve para recibir datos
+            market_price = ticker.last or ticker.marketPrice()
+            if market_price and market_price > 0:
+                close_px = float(market_price)
+                print(f"[LIVE][PRICE] {symbol}: {close_px:.2f} (live)")
+    except Exception as e:
+        print(f"[LIVE][PRICE][WARN] {symbol}: {e}")
+
     is_open = symbol_has_open(symbol)
 
     # =============== POSICIONES ABIERTAS ===============
@@ -951,7 +959,7 @@ def analyze_symbol_live(symbol):
 
         gain_pct = (close_px / float(entry_px) - 1.0) * 100.0
 
-        # 🔍 Detectar si ya se hizo un TP parcial (según comentario en DB)
+        # 🔍 Detectar si ya se hizo un TP parcial
         tp_done = False
         cur.execute("""
             SELECT comentario FROM operaciones
@@ -961,7 +969,7 @@ def analyze_symbol_live(symbol):
         if row and row[0] and 'TP parcial 8%' in row[0]:
             tp_done = True
 
-        # 🟢 Take Profit parcial único al +8% y Stop BE (solo si no se hizo antes)
+        # 🟢 Take Profit parcial único al +8% y Stop BE
         if not tp_done and gain_pct >= 8.0 and qty > 1:
             half_qty = qty // 2
             remaining_qty = qty - half_qty
@@ -971,42 +979,42 @@ def analyze_symbol_live(symbol):
 
                 # 1️⃣ Vende mitad
                 order_tp = MarketOrder('SELL', half_qty)
-                order_tp.account = ACCOUNT_ID           # ✅ especifica cuenta
+                order_tp.account = ACCOUNT_ID
                 ib.placeOrder(c, order_tp)
                 close_trade_db(symbol, exit_price=close_px, comentario_extra='TP parcial 8%')
                 mail_orden(symbol, "SELL", half_qty, close_px, "TP parcial 8%")
 
-                # 2️⃣ Reinsertar la mitad restante y marcar TP parcial hecho
+                # 2️⃣ Reinsertar la mitad restante
                 insert_trade_open_db(symbol, remaining_qty, entry_price=float(entry_px),
                                      comentario='Reentry BE | TP parcial 8%')
 
-                # 🚫 Cancelar stops previos activos antes de colocar uno nuevo (solo de esta cuenta)
+                # 🚫 Cancelar stops previos
                 open_orders = ib.openOrders()
                 for o in open_orders:
                     if getattr(o, "account", None) != ACCOUNT_ID:
-                        continue  # ignora órdenes de otra cuenta
+                        continue
                     if hasattr(o, "contract") and o.contract and getattr(o.contract, "symbol", None) == symbol:
                         if o.action == 'SELL' and o.orderType == 'STP':
                             print(f"[LIVE][CANCEL] Cancelando stop previo de {symbol}")
                             ib.cancelOrder(o)
 
-                # 3️⃣ Colocar nuevo Stop en Break-Even (GTC)
+                # 3️⃣ Colocar nuevo Stop BE
                 stop_order = StopOrder('SELL', remaining_qty, stopPrice=float(entry_px))
                 stop_order.tif = 'GTC'
-                stop_order.account = ACCOUNT_ID         # ✅ especifica cuenta
+                stop_order.account = ACCOUNT_ID
                 ib.placeOrder(c, stop_order)
                 print(f"[LIVE][STOP] Stop BE colocado @ {entry_px:.2f} por {remaining_qty} acciones")
 
-            return  # corta acá si hubo TP parcial
+            return
 
-        # 🔴 Stop o señal opuesta (evaluado siempre)
+        # 🔴 Stop o señal opuesta
         if _should_stop(symbol, df, float(entry_px)) or (sig == -1) or (direction == 1):
             c = resolve_contract(symbol)
             if c is None:
                 return
             print(f"[LIVE] CLOSE {symbol} x{qty} (stop/signal)")
             order_close = MarketOrder('SELL', qty)
-            order_close.account = ACCOUNT_ID           # ✅ especifica cuenta
+            order_close.account = ACCOUNT_ID
             ib.placeOrder(c, order_close)
             close_trade_db(symbol, exit_price=close_px, comentario_extra='LIVE stop/signal')
             mail_orden(symbol, "SELL", qty, close_px, "Salida LIVE stop/signal")
@@ -1030,30 +1038,35 @@ def analyze_symbol_live(symbol):
 
     if (sig == 1) or (direction == -1):
         avail_cash = get_available_funds_usd()
-        qty = calc_qty_by_cash(px, avail_cash)
+        qty = calc_qty_by_cash(close_px, avail_cash)
         src = 'CASH'
         if qty < 1 and USE_BUYING_POWER:
             bp = get_buying_power_usd()
-            qbp = calc_qty_by_bp(px, bp)
+            qbp = calc_qty_by_bp(close_px, bp)
             if qbp >= 1:
                 qty = qbp
                 src = 'BP'
         if qty < 1:
             print(f"[LIVE] sin saldo para {symbol}")
             return
+
         c = resolve_contract(symbol)
         if c is None:
             return
-        print(f"[LIVE] BUY {symbol} x{qty} ({src})")
 
+        print(f"[LIVE] BUY {symbol} x{qty} ({src}) @ {close_px:.2f}")
+
+        # 🟢 Ejecutar compra con precio live
         order_buy = MarketOrder('BUY', qty)
-        order_buy.account = ACCOUNT_ID                # ✅ especifica cuenta
+        order_buy.account = ACCOUNT_ID
         ib.placeOrder(c, order_buy)
 
-        insert_trade_open_db(symbol, qty, entry_price=px, comentario='LIVE entry')
-        mail_orden(symbol, "BUY", qty, px, "Entrada LIVE KalmanHullST")
+        # Registrar operación con precio de mercado real
+        insert_trade_open_db(symbol, qty, entry_price=close_px, comentario='LIVE entry (precio real)')
+        mail_orden(symbol, "BUY", qty, close_px, "Entrada LIVE KalmanHullST")
     else:
         print(f"[LIVE] No-Entry {symbol} | sig={sig} dir={direction}")
+
 
 
 # ===================== KILL-SWITCH (DD diario) =====================
@@ -1246,6 +1259,6 @@ if __name__ == '__main__':
     if MODE_N == "LIVE":
         ensure_ib_connection()
         iniciar_scheduler_diario()
-        run_24h_loop(interval_open_minutes=10)
+        run_24h_loop(interval_open_minutes=5)
 
 
