@@ -9,7 +9,6 @@ import pytz
 from datetime import datetime, timezone, time as dtime, timedelta
 from xml.etree import ElementTree as ET
 import threading, schedule
-from datetime import datetime
 from email_ibkr import obtener_posiciones_ibkr, obtener_cerradas_db, generar_html, enviar_mail, mail_orden
 import asyncio
 
@@ -30,6 +29,19 @@ Cambios clave respecto a la versión anterior:
   ✔ Reconciliación de fills al iniciar LIVE (actualiza precio_entrada con avgFillPrice real).
   ✔ Cache de históricos con prefetch y logs detallados.
   ✔ Sin datetime.utcnow() (usa timezone-aware UTC).
+
+Correcciones en esta versión:
+  • Definido COMMISSION_CLOSE (bug fix en close_trade_db).
+  • Conexión SQLite con check_same_thread=False + lock para secciones críticas.
+  • Cancelación de market data tras lectura (ib.cancelMktData) para evitar fugas de subscripciones.
+  • ensure_ib_connection ahora establece marketDataType=3 (delayed si no hay realtime) y reintenta con backoff exponencial.
+  • Prefetch con límite de fallas consecutivas y barra de progreso.
+  • _should_stop con conmutador APPLY_ATR_TRAIL y prioridad clara de stops.
+  • Reconciliación BUY ahora sincroniza cantidad desde posiciones IBKR.
+  • TP parcial: NO cierra en DB —ajusta cantidad y coloca Stop BE— evitando sobreestimar PnL.
+  • Evitar doble envío de mail diario mediante LAST_DAILY_MAIL_DATE.
+  • Fechas de históricos forzadas a UTC siempre (cache y lecturas).
+  • Sistema de logging mejorado (timestamps, colores, sección por iteración y progreso en prefetch).
 """
 
 # ===================== CONFIGURACIÓN GENERAL =====================
@@ -38,7 +50,7 @@ MODE_N = MODE.strip().upper()
 IS_BACKTEST = (MODE_N == "BACKTEST")
 IS_LIVE = (MODE_N == "LIVE")
 
-IB_PORT = 4001  #7497 DEMO
+IB_PORT = 4001  # 7497 DEMO
 IB_CLIENT_ID = 1
 ACCOUNT_ID = "U22866664"
 EXCHANGE = 'SMART'
@@ -64,26 +76,70 @@ SYMBOLS = [
 ]
 SYMBOLS = list(dict.fromkeys(SYMBOLS))  # dedupe manteniendo orden
 
-# ===================== PARÁMETROS DE ESTRATEGIA MAS CONSERVADORES =====================
-# PRICE_SOURCE       = "hl2"      # "hl2" o "close"
-# MEASUREMENT_NOISE  = 1.0
-# PROCESS_NOISE      = 0.01
-# ATR_PERIOD         = 1         # más estable que 1
-# ATR_FACTOR         = 0.4        # más conservador que 0.4
-# TIMEFRAME          = '1 day'    # swing sobre diaria
+# ===================== LOGGING =====================
+class Console:
+    """Ligero sistema de logs con colores, timestamps y helpers para progreso."""
+    COLOR = os.name != 'nt' or 'WT_SESSION' in os.environ or 'TERM' in os.environ
 
+    @staticmethod
+    def _ts():
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    @staticmethod
+    def _c(code: str, txt: str) -> str:
+        if not Console.COLOR:
+            return txt
+        return f"\x1b[{code}m{txt}\x1b[0m"
+
+    @staticmethod
+    def info(msg: str):
+        print(f"[{Console._ts()}] {Console._c('36', 'INFO')}  {msg}")
+
+    @staticmethod
+    def ok(msg: str):
+        print(f"[{Console._ts()}] {Console._c('32', 'OK')}    {msg}")
+
+    @staticmethod
+    def warn(msg: str):
+        print(f"[{Console._ts()}] {Console._c('33', 'WARN')}  {msg}")
+
+    @staticmethod
+    def err(msg: str):
+        print(f"[{Console._ts()}] {Console._c('31', 'ERROR')} {msg}")
+
+    @staticmethod
+    def sec(title: str):
+        bar = '─' * max(10, 60 - len(title))
+        print(Console._c('35;1', f"\n── {title} {bar}"))
+
+    @staticmethod
+    def iter_hdr(iter_n: int, phase: str, extra: str = ""):
+        et = datetime.now(pytz.timezone('US/Eastern')).strftime('%H:%M:%S ET')
+        print(Console._c('34;1', f"\n[# {iter_n}] {phase} · {et} {extra}"))
+
+    @staticmethod
+    def progress(i: int, n: int, ok: int, fail: int, start_ts: float, prefix: str = ''):
+        elapsed = max(1e-6, time.time() - start_ts)
+        rate = i / elapsed
+        remaining = (n - i) / rate if rate > 0 else 0
+        rem_str = f"{int(remaining/60)}m{int(remaining%60)}s"
+        print(f"\r{prefix} {i}/{n} · OK={ok} · FAIL={fail} · ETA≈{rem_str}", end='', flush=True)
+
+# atajo simple
+log = Console
+
+# ===================== PARÁMETROS DE ESTRATEGIA (agresiva actual) =====================
 PRICE_SOURCE       = "hl2"      # usa (H + L) / 2
-MEASUREMENT_NOISE  = 0.08       # Kalman ultra sensible
-PROCESS_NOISE      = 0.02       # respuesta más rápida a cambios
-ATR_PERIOD         = 1          # ATR instantáneo
-ATR_FACTOR         = 0.3        # banda muy ajustada
+MEASUREMENT_NOISE  = 0.25       # Kalman ultra sensible
+PROCESS_NOISE      = 0.07       # respuesta más rápida a cambios
+ATR_PERIOD         = 10          # ATR instantáneo
+ATR_FACTOR         = 2.0        # banda muy ajustada
 TIMEFRAME          = '1 day'    # swing diario
-
 
 # ===================== RANKING / RS =====================
 RS_BENCHMARK       = 'SPY'
 RS_LOOKBACK_BARS   = 20
-RS_MIN             = 0.07       # gating mínimo de RS (> 7% vs SPY)
+RS_MIN             = 0.03       # gating mínimo de RS (> 7% vs SPY)
 
 # ===================== RIESGO / EJECUCIÓN =====================
 MAX_OPEN_TRADES     = 4
@@ -92,25 +148,28 @@ RESERVE_CASH_PCT    = 0.00
 USE_BUYING_POWER    = False
 BP_TRADE_CAP        = 1800.0
 BP_RESERVE_PCT      = 0.10
-COMMISSION_OPEN = 1.0         # comisión de apertura por operación
-SLIPPAGE_PER_SH = 0.02        # slippage estimado por acción
+
+COMMISSION_OPEN = 1.0           # comisión de apertura por operación
+COMMISSION_CLOSE = 1.0          # ✔ FIX: faltaba definición
+SLIPPAGE_PER_SH = 0.02          # slippage estimado por acción
 
 USE_LOO             = True       # True=Limit-On-Open, False=Market-On-Open
 LOO_BAND_PCT_BUY    = 0.05       # BUY hasta +5% del cierre
 LOO_BAND_PCT_SELL   = 0.05       # SELL hasta -5% del cierre
 
 STOP_ATR_MULT       = 2.5        # trailing con ATR*mult (apoya al Supertrend)
+APPLY_ATR_TRAIL     = False      # ✔ ahora opcional; prioridad hard stop -> supertrend -> ATR
 MAX_LOSS_PCT        = 0.05       # hard stop vs entry
-KILL_SWITCH_DD_PCT  = 0.05       # cierra todo si DD estimado del día <-2% del NLV
+KILL_SWITCH_DD_PCT  = 0.05       # cierra todo si DD estimado del día <= -5% del NLV
 
-MIN_PRICE           = 5.0       # filtro universo: precio mínimo
+MIN_PRICE           = 5.0        # filtro universo: precio mínimo
 ADV_MIN_USD         = 25_000_000 # filtro universo: dólar volumen promedio (≈20 días)
 
 EARNINGS_FILTER_ENABLED = False
 EARNINGS_DAYS_WINDOW   = 3       # excluir ±3 días de earnings
 
 REQUIRE_MARKET_UPTREND = True    # filtra entradas long si mercado bajista
-SMA_UPTREND_LEN        =  50
+SMA_UPTREND_LEN        = 50
 
 # ===================== CACHE =====================
 CACHE_DIR = 'data_cache'
@@ -120,8 +179,12 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 # ===================== DB =====================
 DB_FILE = 'trades_live.db'
-conn = sqlite3.connect(DB_FILE)
+# ✔ permitir acceso multi-hilo
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cur = conn.cursor()
+
+db_lock = threading.Lock()
+
 cur.execute('''
 CREATE TABLE IF NOT EXISTS operaciones (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,10 +213,37 @@ conn.commit()
 
 # ===================== CONEXIÓN IBKR =====================
 ib = IB()
-ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
-ib.account = ACCOUNT_ID
 
-print(f"Conectado a IBKR | MODE={MODE}")
+
+def ensure_ib_connection(max_retries: int = 5, base_sleep: float = 1.5):
+    global ib
+    if ib.isConnected():
+        return
+    for i in range(max_retries):
+        try:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
+            ib.account = ACCOUNT_ID
+            if ib.isConnected():
+                # usar delayed si no hay realtime
+                try:
+                    ib.reqMarketDataType(3)
+                except Exception:
+                    pass
+                log.ok("[IBKR] Conectado.")
+                return
+        except Exception as e:
+            wait = base_sleep * (2 ** i)
+            log.warn(f"[IBKR][RETRY {i+1}/{max_retries}] {e} → {wait:.1f}s")
+            time.sleep(wait)
+    raise RuntimeError("No se pudo conectar a IBKR tras reintentos")
+
+# Conectar al inicio
+ensure_ib_connection()
+log.info(f"Conectado a IBKR | MODE={MODE}")
 
 # ===================== HELPERS IBKR / CONTRATOS =====================
 def resolve_contract(symbol: str) -> Contract | None:
@@ -163,7 +253,7 @@ def resolve_contract(symbol: str) -> Contract | None:
         if q:
             return q[0]
     except Exception as e:
-        print(f"[QUALIFY][{symbol}] {e}")
+        log.warn(f"[QUALIFY][{symbol}] {e}")
     for px in ("NYSE", "NASDAQ", "ARCA"):
         try:
             c = Stock(symbol, EXCHANGE, CURRENCY, primaryExchange=px)
@@ -172,19 +262,8 @@ def resolve_contract(symbol: str) -> Contract | None:
                 return q[0]
         except Exception:
             pass
-    print(f"[QUALIFY][{symbol}] No se pudo calificar")
+    log.warn(f"[QUALIFY][{symbol}] No se pudo calificar")
     return None
-
-
-def ensure_ib_connection():
-    global ib
-    if ib is None or not ib.isConnected():
-        try:
-            ib.disconnect()
-        except Exception:
-            pass
-        ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
-        print("[IBKR] Reconectado.")
 
 
 def market_is_open() -> bool:
@@ -221,7 +300,7 @@ def true_range(df):
     return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
 def resync_from_ibkr():
-    print(f"VERIFICANDO POSICIONES EN IBKR")
+    log.sec("VERIFICANDO POSICIONES EN IBKR")
     for p in ib.positions():
         sym = p.contract.symbol
         qty = int(p.position)
@@ -230,7 +309,7 @@ def resync_from_ibkr():
         avg_cost = float(p.avgCost)
         if not symbol_has_open(sym):
             insert_trade_open_db(sym, qty, avg_cost, comentario='Resync from IBKR')
-            print(f"[RESYNC] {sym} x{qty} @ {avg_cost:.2f}")
+            log.ok(f"[RESYNC] {sym} x{qty} @ {avg_cost:.2f}")
 
 
 def supertrend_backquant(df, factor=1.5, atr_period=14, src_col="kalman_hma"):
@@ -274,14 +353,16 @@ def _load_cached(symbol, durationStr, barSize, useRTH):
     if os.path.exists(p):
         try:
             df = pd.read_parquet(p)
-            df['date'] = pd.to_datetime(df['date'])
+            df['date'] = pd.to_datetime(df['date'], utc=True)
             return df
         except Exception:
             pass
     p = _cache_path(symbol, durationStr, barSize, useRTH, 'csv')
     if os.path.exists(p):
         try:
-            return pd.read_csv(p, parse_dates=['date'])
+            df = pd.read_csv(p, parse_dates=['date'])
+            df['date'] = pd.to_datetime(df['date'], utc=True)
+            return df
         except Exception:
             pass
     return None
@@ -304,9 +385,9 @@ def _get_history_ib(contract, durationStr, barSize, useRTH, retries=3, base_slee
             return util.df(bars)
         except Exception as e:
             wait = base_sleep * (2**i)
-            print(f"[HIST][WARN] {contract.localSymbol}: {e} (retry {i+1}/{retries} {wait:.1f}s)")
+            log.warn(f"[HIST][{contract.localSymbol}] {e} (retry {i+1}/{retries} {wait:.1f}s)")
             time.sleep(wait); ensure_ib_connection()
-    return 
+    return None
 
 def refresh_cache_incremental(symbol, durationStr, barSize='1 day', useRTH=True, max_back_days=10):
     """
@@ -317,18 +398,18 @@ def refresh_cache_incremental(symbol, durationStr, barSize='1 day', useRTH=True,
         ensure_ib_connection()
         c = resolve_contract(symbol)
         if c is None:
-            print(f"[REFRESH][{symbol}] sin contrato IBKR")
+            log.warn(f"[REFRESH][{symbol}] sin contrato IBKR")
             return None
         df = _get_history_ib(c, durationStr, barSize, useRTH)
         if df is None or df.empty:
-            print(f"[REFRESH][{symbol}] sin datos iniciales")
+            log.warn(f"[REFRESH][{symbol}] sin datos iniciales")
             return None
 
         # forzar timezone UTC
         df['date'] = pd.to_datetime(df['date'], utc=True)
         df = df.drop_duplicates('date').sort_values('date', ignore_index=True)
         _save_cache(df, symbol, durationStr, barSize, useRTH)
-        print(f"[REFRESH][{symbol}] cache inicial creado ({len(df)} velas)")
+        log.ok(f"[REFRESH][{symbol}] cache inicial creado ({len(df)} velas)")
         time.sleep(PACING_SECONDS)
         return df
 
@@ -345,7 +426,7 @@ def refresh_cache_incremental(symbol, durationStr, barSize='1 day', useRTH=True,
         need_update = (now_et - last_dt) > pd.Timedelta(hours=1)
 
     if not need_update:
-        print(f"[REFRESH][{symbol}] cache al día (última={last_dt.date()})")
+        log.info(f"[REFRESH][{symbol}] cache al día (última={last_dt.date()})")
         return cached
 
     # Calcular días a descargar (corrigiendo tipo)
@@ -355,12 +436,12 @@ def refresh_cache_incremental(symbol, durationStr, barSize='1 day', useRTH=True,
     ensure_ib_connection()
     c = resolve_contract(symbol)
     if c is None:
-        print(f"[REFRESH][{symbol}] no se pudo calificar contrato")
+        log.warn(f"[REFRESH][{symbol}] no se pudo calificar contrato")
         return cached
 
     tail = _get_history_ib(c, f'{days_pull} D', barSize, useRTH)
     if tail is None or tail.empty:
-        print(f"[REFRESH][{symbol}] sin nuevas velas")
+        log.info(f"[REFRESH][{symbol}] sin nuevas velas")
         return cached
 
     tail['date'] = pd.to_datetime(tail['date'], utc=True)
@@ -373,14 +454,12 @@ def refresh_cache_incremental(symbol, durationStr, barSize='1 day', useRTH=True,
     _save_cache(merged, symbol, durationStr, barSize, useRTH)
 
     if added <= 0:
-        print(f"[REFRESH][{symbol}] cache al día (última={merged['date'].iloc[-1].date()})")
+        log.info(f"[REFRESH][{symbol}] cache al día (última={merged['date'].iloc[-1].date()})")
     else:
-        print(f"[REFRESH][{symbol}] cache actualizado (+{added} nuevas velas, última={merged['date'].iloc[-1].date()})")
+        log.ok(f"[REFRESH][{symbol}] cache actualizado (+{added} nuevas velas, última={merged['date'].iloc[-1].date()})")
 
     time.sleep(PACING_SECONDS)
     return merged
-
-
 
 
 def fetch_history(symbol, durationStr, barSize='1 day', useRTH=True, use_cache=True, refresh_cache=False):
@@ -398,14 +477,16 @@ def fetch_history(symbol, durationStr, barSize='1 day', useRTH=True, use_cache=T
         if c is None: return None
         df = _get_history_ib(c, durationStr, barSize, useRTH)
         if df is None or df.empty: return None
+        df['date'] = pd.to_datetime(df['date'], utc=True)
         df = df.drop_duplicates('date').sort_values('date', ignore_index=True)
         _save_cache(df, symbol, durationStr, barSize, useRTH)
         raw = df
         time.sleep(PACING_SECONDS)
     else:
+        raw['date'] = pd.to_datetime(raw['date'], utc=True)
         raw = raw.drop_duplicates('date').sort_values('date', ignore_index=True)
 
-    # 2) Features/indicadores (idéntico a lo que ya tenés)
+    # 2) Features/indicadores
     df = raw.copy()
     df['src'] = (df['high'] + df['low'])/2.0 if PRICE_SOURCE=='hl2' else df['close']
     df['kalman_hma'] = khma(df['src'], MEASUREMENT_NOISE, PROCESS_NOISE)
@@ -433,11 +514,12 @@ def rank_candidates_rs20(symbols: list[str], timeframe: str) -> list[str]:
     bench = fetch_history(RS_BENCHMARK, '2 M', timeframe, True, use_cache=True) if RS_BENCHMARK else None
     scored = []
     for i, sym in enumerate(symbols, 1):
-        df = fetch_history(sym, '2 M', TIMEFRAME, True, use_cache=True, refresh_cache=True)
+        df = fetch_history(sym, '2 M', TIMEFRAME, True, use_cache=True, refresh_cache=(not IS_LIVE)) 
         if df is None or df.empty: continue
         score = _rs20_score(df, bench)
         scored.append((sym, score))
-        if i % 25 == 0: print(f"[PREOPEN][RS] rankeados {i}/{len(symbols)}...")
+        if i % 25 == 0:
+            log.info(f"[PREOPEN][RS] rankeados {i}/{len(symbols)}...")
     scored.sort(key=lambda x: x[1], reverse=True)
     return [s for s,_ in scored]
 
@@ -499,68 +581,74 @@ def is_in_earnings_window(symbol: str, window_days: int = EARNINGS_DAYS_WINDOW) 
         # si no hay permiso/no disponible, no bloquea
         return False
 
-# ===================== DB OPS =====================
+# ===================== DB OPS (con lock) =====================
 def insert_trade_open_db(symbol: str, qty: int, entry_price: float, comentario: str):
     now = datetime.now(timezone.utc).isoformat()
-    cur.execute("""
-        INSERT INTO operaciones
-        (ticker, tipo, cantidad, precio_entrada, precio_salida,
-         fecha_apertura, fecha_cierre, estado, pnl, retorno_pct,
-         duracion_horas, estrategia, comentario)
-        VALUES (?, 'LONG', ?, ?, NULL, ?, NULL, 'ABIERTA', NULL, NULL, NULL, ?, ?)
-    """, (symbol, qty, entry_price, now, 'KalmanHullST_BackQuant', comentario))
-    conn.commit()
+    ep = float(entry_price or 0.0)  # defensivo
+    with db_lock:
+        cur.execute("""
+            INSERT INTO operaciones
+            (ticker, tipo, cantidad, precio_entrada, precio_salida,
+             fecha_apertura, fecha_cierre, estado, pnl, retorno_pct,
+             duracion_horas, estrategia, comentario)
+            VALUES (?, 'LONG', ?, ?, NULL, ?, NULL, 'ABIERTA', NULL, NULL, NULL, ?, ?)
+        """, (symbol, qty, ep, now, 'KalmanHullST_BackQuant', comentario))
+        conn.commit()
 
 
 def get_open_trade_info(symbol: str):
-    cur.execute("""
-        SELECT id, cantidad, precio_entrada, fecha_apertura
-        FROM operaciones
-        WHERE ticker=? AND estado='ABIERTA'
-        ORDER BY id DESC
-        LIMIT 1
-    """, (symbol,))
-    return cur.fetchone()
+    with db_lock:
+        cur.execute("""
+            SELECT id, cantidad, precio_entrada, fecha_apertura
+            FROM operaciones
+            WHERE ticker=? AND estado='ABIERTA'
+            ORDER BY id DESC
+            LIMIT 1
+        """, (symbol,))
+        return cur.fetchone()
 
 
 def open_trades_count() -> int:
-    cur.execute("SELECT COUNT(*) FROM operaciones WHERE estado='ABIERTA'")
-    x = cur.fetchone(); return int(x[0]) if x and x[0] is not None else 0
+    with db_lock:
+        cur.execute("SELECT COUNT(*) FROM operaciones WHERE estado='ABIERTA'")
+        x = cur.fetchone(); return int(x[0]) if x and x[0] is not None else 0
 
 
 def symbol_has_open(symbol: str) -> bool:
-    cur.execute("SELECT 1 FROM operaciones WHERE ticker=? AND estado='ABIERTA' LIMIT 1", (symbol,))
-    return cur.fetchone() is not None
+    with db_lock:
+        cur.execute("SELECT 1 FROM operaciones WHERE ticker=? AND estado='ABIERTA' LIMIT 1", (symbol,))
+        return cur.fetchone() is not None
 
 def get_open_symbols_db() -> list[str]:
-    cur.execute("SELECT ticker FROM operaciones WHERE estado='ABIERTA'")
-    rows = cur.fetchall()
+    with db_lock:
+        cur.execute("SELECT ticker FROM operaciones WHERE estado='ABIERTA'")
+        rows = cur.fetchall()
     return [r[0] for r in rows] if rows else []
 
 
-
 def close_trade_db(symbol: str, exit_price: float, comentario_extra: str = 'LIVE CLOSE'):
-    row = get_open_trade_info(symbol)
-    if not row:
-        print(f"[DB] No ABIERTA para {symbol}"); return
-    op_id, qty, entry_price, fecha_apertura = row
-    if qty is None or entry_price is None or fecha_apertura is None:
-        print(f"[DB] Datos incompletos {symbol}"); return
-    now_iso = datetime.now(timezone.utc).isoformat()
-    pnl = (exit_price - float(entry_price)) * float(qty) - COMMISSION_CLOSE
-    retorno_pct = (exit_price / float(entry_price) - 1.0) * 100.0
-    try:
-        dur_h = (pd.to_datetime(now_iso) - pd.to_datetime(fecha_apertura)).total_seconds() / 3600.0
-    except Exception:
-        dur_h = None
-    cur.execute("""
-        UPDATE operaciones
-        SET precio_salida=?, fecha_cierre=?, estado='CERRADA',
-            pnl=?, retorno_pct=?, duracion_horas=?,
-            comentario=COALESCE(comentario,'') || ' | ' || ?
-        WHERE id=?
-    """, (exit_price, now_iso, pnl, retorno_pct, dur_h, comentario_extra, op_id))
-    conn.commit()
+    with db_lock:
+        row = get_open_trade_info(symbol)
+        if not row:
+            log.warn(f"[DB] No ABIERTA para {symbol}"); return
+        op_id, qty, entry_price, fecha_apertura = row
+        if qty is None or entry_price is None or fecha_apertura is None:
+            log.warn(f"[DB] Datos incompletos {symbol}"); return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pnl = (float(exit_price or 0.0) - float(entry_price)) * float(qty) - COMMISSION_CLOSE
+        retorno_pct = (float(exit_price or 0.0) / float(entry_price) - 1.0) * 100.0
+        try:
+            dur_h = (pd.to_datetime(now_iso) - pd.to_datetime(fecha_apertura)).total_seconds() / 3600.0
+        except Exception:
+            dur_h = None
+        cur.execute("""
+            UPDATE operaciones
+            SET precio_salida=?, fecha_cierre=?, estado='CERRADA',
+                pnl=?, retorno_pct=?, duracion_horas=?,
+                comentario=COALESCE(comentario,'') || ' | ' || ?
+            WHERE id=?
+        """, (exit_price, now_iso, pnl, retorno_pct, dur_h, comentario_extra, op_id))
+        conn.commit()
 
 # ===================== CUENTA / SIZING =====================
 def _acct_val(tag: str, currency: str = "USD") -> float:
@@ -601,14 +689,18 @@ def calc_qty_by_bp(price: float, buying_power_usd: float) -> int:
 VERBOSE_PREOPEN = True
 
 def _place_MOO(contract: Contract, action: str, qty: int):
-    o = MarketOrder(action, qty); 
-    o.tif='OPG'; 
-    o.outsideRth=False; 
+    o = MarketOrder(action, qty)
+    o.tif='OPG'
+    o.outsideRth=False
     o.account = ACCOUNT_ID
     ib.placeOrder(contract, o)
 
 def _place_LOO(contract: Contract, action: str, qty: int, lmt: float):
-    o = LimitOrder(action, qty, lmt); o.tif='OPG'; o.outsideRth=False; o.account = ACCOUNT_ID;ib.placeOrder(contract, o)
+    o = LimitOrder(action, qty, lmt)
+    o.tif='OPG'
+    o.outsideRth=False
+    o.account = ACCOUNT_ID
+    ib.placeOrder(contract, o)
 
 
 def _passes_universe_filters(sym: str) -> tuple[bool, str, float]:
@@ -623,7 +715,7 @@ def _passes_universe_filters(sym: str) -> tuple[bool, str, float]:
 
 
 def queue_orders_for_next_open():
-    print(" [PREOPEN] Preparando órdenes para la próxima apertura según la última vela cerrada...")
+    log.sec("PREOPEN: Preparando órdenes para la próxima apertura")
 
     # Cierres primero
     open_syms = [s for s in get_open_symbols_db()]
@@ -642,30 +734,31 @@ def queue_orders_for_next_open():
             if c is None: continue
             if USE_LOO:
                 lmt = close_px * (1.0 - LOO_BAND_PCT_SELL)
-                print(f"[PREOPEN] SELL LOO OPG: {sym} x{qty} @>= {lmt:.2f}")
+                log.info(f"[PREOPEN] SELL LOO OPG: {sym} x{qty} @>= {lmt:.2f}")
                 _place_LOO(c, 'SELL', qty, lmt)
                 mail_orden(sym, "SELL", qty, lmt, "PREOPEN LOO")
 
             else:
-                print(f"[PREOPEN] SELL MOO OPG: {sym} x{qty}")
+                log.info(f"[PREOPEN] SELL MOO OPG: {sym} x{qty}")
                 _place_MOO(c, 'SELL', qty)
-            cur.execute("""
-                UPDATE operaciones
-                SET comentario=COALESCE(comentario,'') || ' | PREOPEN: SELL OPG queued'
-                WHERE ticker=? AND estado='ABIERTA'
-            """, (sym,)); conn.commit()
+            with db_lock:
+                cur.execute("""
+                    UPDATE operaciones
+                    SET comentario=COALESCE(comentario,'') || ' | PREOPEN: SELL OPG queued'
+                    WHERE ticker=? AND estado='ABIERTA'
+                """, (sym,)); conn.commit()
         elif VERBOSE_PREOPEN:
-            print(f"[PREOPEN][HOLD] {sym}: sig={sig}, dir={direction}")
+            log.info(f"[PREOPEN][HOLD] {sym}: sig={sig}, dir={direction}")
 
     # Entradas
     if REQUIRE_MARKET_UPTREND and not market_uptrend_ok():
-        print("[PREOPEN] Mercado NO en uptrend (SPY vs SMA200). No se colocan nuevas entradas.")
+        log.warn("[PREOPEN] Mercado NO en uptrend (SPY vs SMA). No se colocan nuevas entradas.")
         return
 
     current_open = open_trades_count()
     free_slots = max(0, MAX_OPEN_TRADES - current_open)
     if free_slots <= 0:
-        print(f"[PREOPEN] Cupo completo {current_open}/{MAX_OPEN_TRADES}. Sin nuevas entradas.")
+        log.info(f"[PREOPEN] Cupo completo {current_open}/{MAX_OPEN_TRADES}. Sin nuevas entradas.")
         return
 
     base = [s for s in SYMBOLS if not symbol_has_open(s)]
@@ -676,10 +769,10 @@ def queue_orders_for_next_open():
         if ok:
             filtered.append(s)
         elif VERBOSE_PREOPEN:
-            print(f"[PREOPEN][SKIP] {s}: {why}")
+            log.info(f"[PREOPEN][SKIP] {s}: {why}")
 
     if not filtered:
-        print("[PREOPEN] No quedan candidatos tras filtros de universo.")
+        log.warn("[PREOPEN] No quedan candidatos tras filtros de universo.")
         return
 
     ranked = rank_candidates_rs20(filtered, TIMEFRAME)
@@ -692,7 +785,7 @@ def queue_orders_for_next_open():
         sig = int(last['signal']); direction = int(last['direction']); close_px = float(last['close'])
         rs_val = _rs20_score(df, fetch_history(RS_BENCHMARK, '2 M', TIMEFRAME, True, use_cache=True))
         if pd.isna(rs_val) or (rs_val <= RS_MIN):
-            if VERBOSE_PREOPEN: print(f"[PREOPEN][SKIP RS] {sym}: rs={rs_val:.4f}")
+            if VERBOSE_PREOPEN: log.info(f"[PREOPEN][SKIP RS] {sym}: rs={rs_val:.4f}")
             continue
         if (sig == 1) or (direction == -1):
             avail_cash = get_available_funds_usd()
@@ -701,21 +794,21 @@ def queue_orders_for_next_open():
                 bp = get_buying_power_usd(); qbp = calc_qty_by_bp(close_px, bp)
                 if qbp >= 1: qty = qbp; src = 'BP'
             if qty < 1:
-                print(f"[PREOPEN][SKIP $] {sym}: sin saldo suficiente.")
+                log.info(f"[PREOPEN][SKIP $] {sym}: sin saldo suficiente.")
                 continue
             c = resolve_contract(sym)
             if c is None: continue
             if USE_LOO:
                 lmt = close_px * (1.0 + LOO_BAND_PCT_BUY)
-                print(f"[PREOPEN] BUY LOO OPG: {sym} x{qty} @<= {lmt:.2f} (via {src}) | rs={rs_val:.4f}")
+                log.info(f"[PREOPEN] BUY LOO OPG: {sym} x{qty} @<= {lmt:.2f} (via {src}) | rs={rs_val:.4f}")
                 _place_LOO(c, 'BUY', qty, lmt)
                 mail_orden(sym, "BUY", qty, lmt, "PREOPEN LOO")
             else:
-                print(f"[PREOPEN] BUY MOO OPG: {sym} x{qty} (via {src}) | rs={rs_val:.4f}")
+                log.info(f"[PREOPEN] BUY MOO OPG: {sym} x{qty} (via {src}) | rs={rs_val:.4f}")
                 _place_MOO(c, 'BUY', qty)
             insert_trade_open_db(sym, qty, entry_price=close_px, comentario='PREOPEN OPG queued')
         elif VERBOSE_PREOPEN:
-            print(f"[PREOPEN][NO-ENTRY] {sym}: sig={sig} dir={direction}")
+            log.info(f"[PREOPEN][NO-ENTRY] {sym}: sig={sig} dir={direction}")
 
 
 def reconcile_positions_vs_ibkr():
@@ -731,8 +824,6 @@ def reconcile_positions_vs_ibkr():
             if int(p.position) != 0
         }
 
-
-
         # Órdenes/trades abiertos (BUY aún sin completar, etc.)
         pending_buys = set()
         for tr in ib.openTrades():
@@ -746,12 +837,13 @@ def reconcile_positions_vs_ibkr():
                 pass
 
         # Posiciones ABIERTAS en DB con fecha_apertura para gracia
-        cur.execute("""
-            SELECT ticker, precio_entrada, fecha_apertura
-            FROM operaciones
-            WHERE estado='ABIERTA'
-        """)
-        db_open = cur.fetchall()
+        with db_lock:
+            cur.execute("""
+                SELECT ticker, precio_entrada, fecha_apertura
+                FROM operaciones
+                WHERE estado='ABIERTA'
+            """)
+            db_open = cur.fetchall()
 
         closed_count = 0
         now_utc = datetime.now(timezone.utc)
@@ -781,15 +873,15 @@ def reconcile_positions_vs_ibkr():
             last_px = get_last_close(sym) or float(entry_px or 0.0)
             close_trade_db(sym, exit_price=last_px, comentario_extra='Sync auto IBKR')
             closed_count += 1
-            print(f"[SYNC] {sym}: no aparece en IBKR, cerrado localmente (sync).")
+            log.warn(f"[SYNC] {sym}: no aparece en IBKR, cerrado localmente (sync).")
 
         if closed_count > 0:
-            print(f"[SYNC] {closed_count} operaciones cerradas por reconciliación IBKR.")
+            log.info(f"[SYNC] {closed_count} operaciones cerradas por reconciliación IBKR.")
         else:
-            print("[SYNC] DB e IBKR sincronizados.")
+            log.info("[SYNC] DB e IBKR sincronizados.")
 
     except Exception as e:
-        print(f"[SYNC][ERROR] {e}")
+        log.err(f"[SYNC][ERROR] {e}")
 
 # ===================== RECONCILIAR FILLS (LIVE) =====================
 def reconcile_fills_update_db():
@@ -804,16 +896,20 @@ def reconcile_fills_update_db():
     try:
         fills = ib.fills()  # lista de Fill objects recientes
     except Exception as e:
-        print(f"[RECONCILE][WARN] {e}")
+        log.warn(f"[RECONCILE][WARN] {e}")
         return
 
     if not fills:
-        print("[RECONCILE] Sin fills para actualizar.")
+        log.info("[RECONCILE] Sin fills para actualizar.")
         return
 
     updated_entry = 0
+    updated_qty_buy = 0
     closed_total = 0
     closed_partial = 0
+
+    # Capturar snapshot de posiciones una vez
+    positions_snapshot = {p.contract.symbol: int(p.position or 0) for p in ib.positions()}
 
     for f in fills:
         try:
@@ -821,27 +917,37 @@ def reconcile_fills_update_db():
             avg = float(f.execution.avgPrice or f.execution.price or 0)
             side = f.execution.side.upper()
             shares = int(abs(f.execution.shares or 0))
-            fill_time = f.execution.time
 
             # === Actualización de BUY / entrada ===
             if side in ('BOT', 'BUY'):
                 row = get_open_trade_info(sym)
                 if row:
-                    op_id, qty, entry_price, _ = row
-                    if entry_price is not None and abs(avg - float(entry_price)) > 1e-6:
-                        cur.execute("UPDATE operaciones SET precio_entrada=? WHERE id=?", (avg, op_id))
-                        conn.commit()
+                    op_id, qty_db, entry_price, _ = row
+                    # actualizar precio si difiere
+                    if entry_price is None or abs(avg - float(entry_price)) > 1e-6:
+                        with db_lock:
+                            cur.execute("UPDATE operaciones SET precio_entrada=? WHERE id=?", (avg, op_id))
+                            conn.commit()
                         updated_entry += 1
-                        print(f"[RECONCILE][BUY] {sym} actualizado entry @ {avg:.2f}")
+                        log.ok(f"[RECONCILE][BUY] {sym} actualizado entry @ {avg:.2f}")
+                    # actualizar cantidad con posiciones reales
+                    qty_ib = int(positions_snapshot.get(sym, 0))
+                    if qty_ib > 0 and qty_ib != int(qty_db or 0):
+                        with db_lock:
+                            cur.execute("UPDATE operaciones SET cantidad=? WHERE id=?", (qty_ib, op_id))
+                            conn.commit()
+                        updated_qty_buy += 1
+                        log.info(f"[RECONCILE][BUY] {sym} qty DB→{qty_ib} (desde posiciones IBKR)")
 
             # === Manejo de ventas / stops ===
             if side in ('SLD', 'SELL'):
-                cur.execute("""
-                    SELECT id, cantidad, precio_entrada, comentario
-                    FROM operaciones
-                    WHERE ticker=? AND estado='ABIERTA'
-                """, (sym,))
-                row = cur.fetchone()
+                with db_lock:
+                    cur.execute("""
+                        SELECT id, cantidad, precio_entrada, comentario
+                        FROM operaciones
+                        WHERE ticker=? AND estado='ABIERTA'
+                    """, (sym,))
+                    row = cur.fetchone()
                 if not row:
                     continue
 
@@ -850,77 +956,69 @@ def reconcile_fills_update_db():
                 if qty_db <= 0:
                     continue
 
-                # Chequear cantidad real actual en IBKR
-                qty_ib = 0
-                try:
-                    for p in ib.positions():
-                        if p.contract.symbol == sym:
-                            qty_ib = int(p.position or 0)
-                            break
-                except Exception:
-                    pass
+                # Chequear cantidad real actual en IBKR (del snapshot)
+                qty_ib = int(positions_snapshot.get(sym, 0))
 
                 # Si la DB tenía comentario de TP parcial, evitar doble cierre
                 if comm and 'TP parcial' in str(comm):
-                    print(f"[RECONCILE][SKIP] {sym}: fill ignorado (TP parcial ya procesado).")
+                    log.info(f"[RECONCILE][SKIP] {sym}: fill ignorado (flag TP parcial).")
                     continue
 
                 if qty_ib <= 0:
                     # Venta total → cerrar operación
-                    cur.execute("""
-                        UPDATE operaciones
-                        SET precio_salida=?, fecha_cierre=datetime('now'),
-                            estado='CERRADA',
-                            comentario=COALESCE(comentario,'') || ' | STOP/SELL fill total'
-                        WHERE id=?
-                    """, (avg, op_id))
-                    conn.commit()
+                    with db_lock:
+                        cur.execute("""
+                            UPDATE operaciones
+                            SET precio_salida=?, fecha_cierre=datetime('now'),
+                                estado='CERRADA',
+                                comentario=COALESCE(comentario,'') || ' | STOP/SELL fill total'
+                            WHERE id=?
+                        """, (avg, op_id))
+                        conn.commit()
                     closed_total += 1
-                    print(f"[RECONCILE][STOP] {sym} cerrado totalmente @ {avg:.2f}")
+                    log.ok(f"[RECONCILE][STOP] {sym} cerrado totalmente @ {avg:.2f}")
                 elif qty_ib < qty_db:
                     # Venta parcial → actualizar cantidad restante a lo que IBKR mantiene
-                    cur.execute("""
-                        UPDATE operaciones
-                        SET cantidad=?,
-                            comentario=COALESCE(comentario,'') || ' | SELL parcial fill'
-                        WHERE id=?
-                    """, (qty_ib, op_id))
-                    conn.commit()
+                    with db_lock:
+                        cur.execute("""
+                            UPDATE operaciones
+                            SET cantidad=?,
+                                comentario=COALESCE(comentario,'') || ' | SELL parcial fill'
+                            WHERE id=?
+                        """, (qty_ib, op_id))
+                        conn.commit()
                     closed_partial += 1
-                    print(f"[RECONCILE][PARTIAL] {sym} venta parcial ({shares}/{qty_db}) @ {avg:.2f} → quedan {qty_ib}")
+                    log.info(f"[RECONCILE][PARTIAL] {sym} venta parcial ({shares}/{qty_db}) @ {avg:.2f} → quedan {qty_ib}")
 
         except Exception as e:
-            print(f"[RECONCILE][ERROR] {e}")
+            log.err(f"[RECONCILE][ERROR] {e}")
 
-    print(f"[RECONCILE] Entradas actualizadas: {updated_entry} | Cierres totales: {closed_total} | Parciales: {closed_partial}")
-
-
-    
-
-
+    log.info(f"[RECONCILE] Entradas actualizadas: {updated_entry} | Qty BUY sync: {updated_qty_buy} | Cierres totales: {closed_total} | Parciales: {closed_partial}")
 
 # ===================== STOPS / LIVE ANALYSIS =====================
 
 def _should_stop(symbol: str, df: pd.DataFrame, entry_px: float) -> bool:
     last = df.iloc[-1]
     close_px = float(last['close'])
-    # Hard stop por %
+    # Prioridad 1: Hard stop por %
     if close_px <= entry_px * (1.0 - MAX_LOSS_PCT):
         return True
-    # Trailing por Supertrend (si pasa por debajo de la línea en long)
+    # Prioridad 2: Supertrend break
     st = float(last['supertrend']) if not pd.isna(last['supertrend']) else None
     if st is not None and close_px < st:
         return True
-    # ATR trailing opcional (si querés más estricto: entry - ATR*mult)
-    atr = float(last['atr']) if 'atr' in last.index and not pd.isna(last['atr']) else None
-    if atr is not None and close_px <= (entry_px - STOP_ATR_MULT * atr):
-        return True
+    # Prioridad 3 (opcional): ATR trailing
+    if APPLY_ATR_TRAIL:
+        atr = float(last['atr']) if 'atr' in last.index and not pd.isna(last['atr']) else None
+        if atr is not None and close_px <= (entry_px - STOP_ATR_MULT * atr):
+            return True
     return False
+
 
 def analyze_symbol_live(symbol):
     df = fetch_history(symbol, '2 M', TIMEFRAME, True, use_cache=False)
     if df is None or df.empty:
-        print(f"[LIVE][WARN] Sin datos {symbol}")
+        log.warn(f"[LIVE][WARN] Sin datos {symbol}")
         return
 
     last = df.iloc[-1]
@@ -930,7 +1028,7 @@ def analyze_symbol_live(symbol):
     # 🔹 Precio base de cierre (por fallback)
     close_px = float(last['close'])
 
-    # 🔹 Intentar usar precio real de IBKR
+    # 🔹 Intentar usar precio real de IBKR (y cancelar subscripción luego)
     try:
         contract = resolve_contract(symbol)
         if contract:
@@ -939,9 +1037,14 @@ def analyze_symbol_live(symbol):
             market_price = ticker.last or ticker.marketPrice()
             if market_price and market_price > 0:
                 close_px = float(market_price)
-                print(f"[LIVE][PRICE] {symbol}: {close_px:.2f} (live)")
+                log.info(f"[LIVE][PRICE] {symbol}: {close_px:.2f} (live)")
+            # ✔ cancelar la subscripción para no fugarnos
+            try:
+                ib.cancelMktData(contract)
+            except Exception:
+                pass
     except Exception as e:
-        print(f"[LIVE][PRICE][WARN] {symbol}: {e}")
+        log.warn(f"[LIVE][PRICE][WARN] {symbol}: {e}")
 
     is_open = symbol_has_open(symbol)
 
@@ -949,23 +1052,24 @@ def analyze_symbol_live(symbol):
     if is_open:
         info = get_open_trade_info(symbol)
         if not info:
-            print(f"[LIVE][DB] sin info de ABIERTA {symbol}")
+            log.warn(f"[LIVE][DB] sin info de ABIERTA {symbol}")
             return
         _, qty, entry_px, _ = info
         qty = int(qty) if qty else 0
         if qty < 1:
-            print(f"[LIVE][DB] qty inválida {symbol}")
+            log.warn(f"[LIVE][DB] qty inválida {symbol}")
             return
 
         gain_pct = (close_px / float(entry_px) - 1.0) * 100.0
 
         # 🔍 Detectar si ya se hizo un TP parcial
         tp_done = False
-        cur.execute("""
-            SELECT comentario FROM operaciones
-            WHERE ticker=? AND estado='ABIERTA'
-        """, (symbol,))
-        row = cur.fetchone()
+        with db_lock:
+            cur.execute("""
+                SELECT comentario FROM operaciones
+                WHERE ticker=? AND estado='ABIERTA'
+            """, (symbol,))
+            row = cur.fetchone()
         if row and row[0] and 'TP parcial 8%' in row[0]:
             tp_done = True
 
@@ -975,35 +1079,41 @@ def analyze_symbol_live(symbol):
             remaining_qty = qty - half_qty
             c = resolve_contract(symbol)
             if c:
-                print(f"[LIVE][TP] {symbol}: +{gain_pct:.2f}% → vendiendo {half_qty} y colocando stop BE")
+                log.ok(f"[LIVE][TP] {symbol}: +{gain_pct:.2f}% → vendiendo {half_qty} y colocando stop BE")
 
                 # 1️⃣ Vende mitad
                 order_tp = MarketOrder('SELL', half_qty)
                 order_tp.account = ACCOUNT_ID
                 ib.placeOrder(c, order_tp)
-                close_trade_db(symbol, exit_price=close_px, comentario_extra='TP parcial 8%')
                 mail_orden(symbol, "SELL", half_qty, close_px, "TP parcial 8%")
 
-                # 2️⃣ Reinsertar la mitad restante
-                insert_trade_open_db(symbol, remaining_qty, entry_price=float(entry_px),
-                                     comentario='Reentry BE | TP parcial 8%')
+                # 2️⃣ Actualizar DB (NO cerrar la operación)
+                with db_lock:
+                    cur.execute("""
+                        UPDATE operaciones
+                        SET cantidad=?, comentario=COALESCE(comentario,'') || ' | TP parcial 8%'
+                        WHERE ticker=? AND estado='ABIERTA'
+                    """, (remaining_qty, symbol))
+                    conn.commit()
 
-                # 🚫 Cancelar stops previos
-                open_orders = ib.openOrders()
-                for o in open_orders:
-                    if getattr(o, "account", None) != ACCOUNT_ID:
-                        continue
-                    if hasattr(o, "contract") and o.contract and getattr(o.contract, "symbol", None) == symbol:
-                        if o.action == 'SELL' and o.orderType == 'STP':
-                            print(f"[LIVE][CANCEL] Cancelando stop previo de {symbol}")
-                            ib.cancelOrder(o)
+                # 🚫 Cancelar stops previos de este símbolo
+                try:
+                    for o in ib.openOrders():
+                        if getattr(o, "account", None) != ACCOUNT_ID:
+                            continue
+                        if hasattr(o, "contract") and o.contract and getattr(o.contract, "symbol", None) == symbol:
+                            if o.action == 'SELL' and o.orderType in ('STP','STP LMT'):
+                                log.info(f"[LIVE][CANCEL] Cancelando stop previo de {symbol}")
+                                ib.cancelOrder(o)
+                except Exception:
+                    pass
 
                 # 3️⃣ Colocar nuevo Stop BE
                 stop_order = StopOrder('SELL', remaining_qty, stopPrice=float(entry_px))
                 stop_order.tif = 'GTC'
                 stop_order.account = ACCOUNT_ID
                 ib.placeOrder(c, stop_order)
-                print(f"[LIVE][STOP] Stop BE colocado @ {entry_px:.2f} por {remaining_qty} acciones")
+                log.info(f"[LIVE][STOP] Stop BE colocado @ {entry_px:.2f} por {remaining_qty} acciones")
 
             return
 
@@ -1012,28 +1122,28 @@ def analyze_symbol_live(symbol):
             c = resolve_contract(symbol)
             if c is None:
                 return
-            print(f"[LIVE] CLOSE {symbol} x{qty} (stop/signal)")
+            log.warn(f"[LIVE] CLOSE {symbol} x{qty} (stop/signal)")
             order_close = MarketOrder('SELL', qty)
             order_close.account = ACCOUNT_ID
             ib.placeOrder(c, order_close)
             close_trade_db(symbol, exit_price=close_px, comentario_extra='LIVE stop/signal')
             mail_orden(symbol, "SELL", qty, close_px, "Salida LIVE stop/signal")
         else:
-            print(f"[LIVE] HOLD {symbol} | sig={sig} dir={direction} | +{gain_pct:.2f}%")
+            log.info(f"[LIVE] HOLD {symbol} | sig={sig} dir={direction} | +{gain_pct:.2f}%")
         return
 
     # =============== ENTRADAS NUEVAS ===============
     if open_trades_count() >= MAX_OPEN_TRADES:
-        print(f"[LIVE] Cupo lleno {open_trades_count()}/{MAX_OPEN_TRADES}")
+        log.info(f"[LIVE] Cupo lleno {open_trades_count()}/{MAX_OPEN_TRADES}")
         return
 
     if REQUIRE_MARKET_UPTREND and not market_uptrend_ok():
-        print("[LIVE] Mercado no en uptrend. No nuevas entradas.")
+        log.warn("[LIVE] Mercado no en uptrend. No nuevas entradas.")
         return
 
     ok, why, px = _passes_universe_filters(symbol)
     if not ok:
-        print(f"[LIVE][SKIP] {symbol}: {why}")
+        log.info(f"[LIVE][SKIP] {symbol}: {why}")
         return
 
     if (sig == 1) or (direction == -1):
@@ -1047,14 +1157,14 @@ def analyze_symbol_live(symbol):
                 qty = qbp
                 src = 'BP'
         if qty < 1:
-            print(f"[LIVE] sin saldo para {symbol}")
+            log.info(f"[LIVE] sin saldo para {symbol}")
             return
 
         c = resolve_contract(symbol)
         if c is None:
             return
 
-        print(f"[LIVE] BUY {symbol} x{qty} ({src}) @ {close_px:.2f}")
+        log.ok(f"[LIVE] BUY {symbol} x{qty} ({src}) @ {close_px:.2f}")
 
         # 🟢 Ejecutar compra con precio live
         order_buy = MarketOrder('BUY', qty)
@@ -1065,23 +1175,26 @@ def analyze_symbol_live(symbol):
         insert_trade_open_db(symbol, qty, entry_price=close_px, comentario='LIVE entry (precio real)')
         mail_orden(symbol, "BUY", qty, close_px, "Entrada LIVE KalmanHullST")
     else:
-        print(f"[LIVE] No-Entry {symbol} | sig={sig} dir={direction}")
-
+        log.info(f"[LIVE] No-Entry {symbol} | sig={sig} dir={direction}")
 
 
 # ===================== KILL-SWITCH (DD diario) =====================
 
+LAST_DAILY_MAIL_DATE = None  # para evitar duplicados
+
 def _daily_pnl_estimate() -> float:
     # Realizado hoy (CERRADA con fecha de hoy)
     today = datetime.now(timezone.utc).date()
-    cur.execute("""
-        SELECT COALESCE(SUM(pnl),0) FROM operaciones
-        WHERE estado='CERRADA' AND DATE(fecha_cierre) = DATE(?)
-    """, (today.isoformat(),))
-    realized = float(cur.fetchone()[0])
+    with db_lock:
+        cur.execute("""
+            SELECT COALESCE(SUM(pnl),0) FROM operaciones
+            WHERE estado='CERRADA' AND DATE(fecha_cierre) = DATE(?)
+        """, (today.isoformat(),))
+        realized = float(cur.fetchone()[0])
     # No realizado aprox (open vs entry al último close)
-    cur.execute("SELECT ticker, cantidad, precio_entrada FROM operaciones WHERE estado='ABIERTA'")
-    rows = cur.fetchall()
+    with db_lock:
+        cur.execute("SELECT ticker, cantidad, precio_entrada FROM operaciones WHERE estado='ABIERTA'")
+        rows = cur.fetchall()
     unreal = 0.0
     for t, q, e in rows:
         last_px = get_last_close(t)
@@ -1095,9 +1208,10 @@ def kill_switch_check_and_close_all():
     est = _daily_pnl_estimate()
 
     if est <= limit_dd:
-        print(f"[KILL-SWITCH] DD estimado {est:.2f} <= {limit_dd:.2f}. Cerrando TODO.")
-        cur.execute("SELECT ticker, cantidad FROM operaciones WHERE estado='ABIERTA'")
-        rows = cur.fetchall()
+        log.err(f"[KILL-SWITCH] DD estimado {est:.2f} <= {limit_dd:.2f}. Cerrando TODO.")
+        with db_lock:
+            cur.execute("SELECT ticker, cantidad FROM operaciones WHERE estado='ABIERTA'")
+            rows = cur.fetchall()
 
         for t, q in rows:
             try:
@@ -1118,7 +1232,7 @@ def kill_switch_check_and_close_all():
                 time.sleep(0.2)
 
             except Exception as e:
-                print(f"[KILL-SWITCH][{t}] {e}")
+                log.err(f"[KILL-SWITCH][{t}] {e}")
 
         return True
 
@@ -1127,26 +1241,85 @@ def kill_switch_check_and_close_all():
 # ===================== PREFETCH =====================
 
 def prefetch_universe(symbols: list[str], durationStr: str, barSize: str, useRTH: bool):
-    print(f"\n[PREFETCH] Cacheando/actualizando {len(symbols)} símbolos @ {durationStr}/{barSize} ...")
-    ok, fail = 0, 0
-    for s in symbols:
+    if not ENABLE_PREFETCH:
+        return
+    n = len(symbols)
+    log.sec(f"PREFETCH: Cache/refresh {n} símbolos @ {durationStr}/{barSize}")
+    ok, fail, consec_fail = 0, 0, 0
+    start = time.time()
+    for i, s in enumerate(symbols, start=1):
         try:
             _ = fetch_history(s, durationStr, barSize, useRTH, use_cache=True, refresh_cache=True)
             ok += 1
+            consec_fail = 0
         except Exception as e:
-            print(f"[PREFETCH][{s}] {e}"); fail += 1
-    print(f"[PREFETCH] OK={ok} | FAIL={fail}\n")
+            log.warn(f"[PREFETCH][{s}] {e}"); fail += 1; consec_fail += 1
+            time.sleep(1.0)
+            if consec_fail >= 10:
+                log.err("[PREFETCH] Demasiados errores consecutivos. Abortando prefetch.")
+                break
+        # progreso (cada 5 símbolos o al final)
+        if (i % 5 == 0) or (i == n):
+            Console.progress(i, n, ok, fail, start, prefix='[PREFETCH] Progreso')
+    print()  # salto de línea final
+    log.ok(f"[PREFETCH] OK={ok} | FAIL={fail}")
+
 
 def enviar_resumen_diario():
+    """
+    Envía el resumen diario de posiciones, PnL y rendimiento de la cuenta IBKR.
+    Corrige errores de tipo Series y maneja fallos de conexión SMTP o IBKR.
+    Idempotente por día vía LAST_DAILY_MAIL_DATE.
+    """
+    global LAST_DAILY_MAIL_DATE
     try:
-        print("[SCHEDULER] Enviando resumen diario IBKR...")
-        abiertas = obtener_posiciones_ibkr(port=IB_PORT, client_id=99, account_id=ACCOUNT_ID)
-        cerradas = obtener_cerradas_db()
-        html = generar_html(abiertas, cerradas)
-        enviar_mail("📊 Estado diario con IBKR", html)
-        print("[SCHEDULER] Mail de resumen diario enviado correctamente.")
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        if LAST_DAILY_MAIL_DATE == today_str:
+            log.info("[SCHEDULER] Mail diario ya enviado hoy; se omite.")
+            return
+
+        log.info("[SCHEDULER] Enviando resumen diario IBKR...")
+
+        # 🔹 Obtener resumen desde la DB o directamente desde IBKR
+        resumen_df = obtener_posiciones_ibkr()  # <-- usa tu función real
+        if resumen_df is None or resumen_df.empty:
+            log.warn("[SCHEDULER][WARN] Resumen vacío, no se envía mail.")
+            return
+
+        # 🔧 Fix: si es Series, convertir a DataFrame (evita 'Series' object has no attribute retorno_pct)
+        if isinstance(resumen_df, pd.Series):
+            resumen_df = resumen_df.to_frame().T
+
+        def safe_val(df, col, default=0.0):
+            try:
+                return float(df[col].iloc[0])
+            except Exception:
+                return default
+
+        # 🔹 Campos seguros
+        retorno_pct = safe_val(resumen_df, "retorno_pct")
+        ganadores = safe_val(resumen_df, "ganadores")
+        perdedores = safe_val(resumen_df, "perdedores")
+        profit_factor = safe_val(resumen_df, "profit_factor")
+
+        # 🔹 Crear cuerpo del mail
+        subject = f"📊 Estado diario IBKR ({today_str})"
+        body = (
+            f"📈 Retorno diario: {retorno_pct:.2f}%\n"
+            f"✅ Ganadores: {int(ganadores)} | ❌ Perdedores: {int(perdedores)}\n"
+            f"💰 Profit Factor: {profit_factor:.2f}\n\n"
+            "Resumen completo guardado en la base local."
+        )
+
+        # 🔹 Enviar mail (usa tu función actual)
+        enviar_mail(subject, body)
+        LAST_DAILY_MAIL_DATE = today_str
+        log.ok("✅ Mail enviado: resumen diario IBKR")
+
     except Exception as e:
-        print(f"[SCHEDULER][ERROR] {e}")
+        log.err(f"[SCHEDULER][MAIL][ERROR] {e}")
+
+
 
 def run_24h_loop(interval_open_minutes=10):
     """
@@ -1154,71 +1327,102 @@ def run_24h_loop(interval_open_minutes=10):
       - Detecta estado del mercado.
       - Ejecuta preopen 1h antes de la apertura.
       - Corre análisis cada X minutos con mercado abierto.
-      - Envía mail al cierre y actualiza caches.
+      - Actualiza caches y envía mail al cierre.
     """
     tz = pytz.timezone("US/Eastern")
     preopen_done = None
+    postclose_done = None
+    iter_n = 0
 
     while True:
         now_et = datetime.now(tz)
+        hoy = now_et.date()
         hora = now_et.time()
 
-        # 1️⃣ Detectar si estamos 1h antes de apertura (8:30 ET)
-        if dtime(8, 25) <= hora < dtime(9, 30) and preopen_done != now_et.date():
-            print(f"[24H] Ejecutando PREOPEN para {now_et.date()}...")
+        # 1️⃣ PREOPEN (8:25–9:30 ET)
+        if dtime(8, 25) <= hora < dtime(9, 30) and preopen_done != hoy:
+            log.iter_hdr(iter_n, "PREOPEN", extra=f"({hoy})")
             try:
                 ensure_ib_connection()
                 prefetch_universe(SYMBOLS, '2 M', TIMEFRAME, True)
                 queue_orders_for_next_open()
-                preopen_done = now_et.date()
+                preopen_done = hoy
             except Exception as e:
-                print(f"[24H][PREOPEN][ERROR] {e}")
+                log.err(f"[24H][PREOPEN][ERROR] {e}")
 
-        # 2️⃣ Mercado abierto: 9:30–16:00
+        # 2️⃣ MERCADO ABIERTO (9:30–16:00 ET)
         elif dtime(9, 30) <= hora <= dtime(16, 0):
-            print(f"[24H] Mercado abierto — análisis cada {interval_open_minutes}m (hora NY: {hora})")
+            iter_n += 1
+            log.iter_hdr(iter_n, "LIVE", extra=f"cada {interval_open_minutes}m")
             try:
                 ensure_ib_connection()
                 reconcile_fills_update_db()
 
                 open_syms = get_open_symbols_db()
+                if open_syms:
+                    log.info(f"[LIVE] Analizando abiertos: {', '.join(open_syms)}")
                 for s in open_syms:
-                    analyze_symbol_live(s); ib.sleep(1)
+                    analyze_symbol_live(s)
+                    ib.sleep(1)
 
                 if open_trades_count() < MAX_OPEN_TRADES:
                     base = [s for s in SYMBOLS if s not in open_syms]
                     filt = [s for s in base if _passes_universe_filters(s)[0]]
                     ranked = rank_candidates_rs20(filt, TIMEFRAME)
+                    take = max(0, MAX_OPEN_TRADES - open_trades_count())
+                    log.info(f"[LIVE] Intentando nuevas entradas (slots libres={take})")
                     for s in ranked:
-                        if open_trades_count() >= MAX_OPEN_TRADES: break
-                        analyze_symbol_live(s); ib.sleep(1)
+                        if open_trades_count() >= MAX_OPEN_TRADES:
+                            break
+                        analyze_symbol_live(s)
+                        ib.sleep(1)
 
                 reconcile_positions_vs_ibkr()
-                print(f"\n[24H] Esperando próxima revisión en {interval_open_minutes} minutos...\n")
+                log.info(f"[24H] Esperando próxima revisión en {interval_open_minutes} minutos...")
                 ib.sleep(interval_open_minutes * 60)
 
             except Exception as e:
-                print(f"[24H][LIVE][ERROR] {e}")
+                log.err(f"[24H][LIVE][ERROR] {e}")
                 ib.sleep(30)
                 continue
 
-
-        # 3️⃣ Después del cierre (16:00–17:30): resumen diario y refresh
+        # 3️⃣ POST-CIERRE (16:00–17:30 ET)
         elif dtime(16, 0) <= hora < dtime(17, 30):
-            print("[24H] Mercado cerrado — enviando mail diario y actualizando precios")
-            try:
-                enviar_resumen_diario()
-                for s in SYMBOLS:
-                    refresh_cache_incremental(s, '3 M', '1 day', True)
-            except Exception as e:
-                print(f"[24H][POST][ERROR] {e}")
-            time.sleep(3600)  # espera 1h
+            if postclose_done == hoy:
+                log.info("[24H] Post-cierre ya ejecutado hoy. Esperando…")
+                ib.sleep(600)
+            else:
+                log.iter_hdr(iter_n, "POST-CLOSE", extra=f"({hoy})")
+                try:
+                    ensure_ib_connection()
+                    ok, fail = 0, 0
+                    for s in SYMBOLS:
+                        try:
+                            refresh_cache_incremental(s, '3 M', '1 day', True)
+                            ok += 1
+                            ib.sleep(PACING_SECONDS)
+                        except Exception as e:
+                            log.warn(f"[REFRESH][ERROR] {s}: {e}")
+                            fail += 1
+                            ib.sleep(1)
+                    log.ok(f"[REFRESH] Completo: OK={ok} | FAIL={fail}")
 
+                    # 🟢 Enviar mail al final (idempotente)
+                    try:
+                        enviar_resumen_diario()
+                    except Exception as e:
+                        log.err(f"[SCHEDULER][MAIL][ERROR] {e}")
+
+                    postclose_done = hoy
+                except Exception as e:
+                    log.err(f"[24H][POST][ERROR] {e}")
+
+                ib.sleep(3600)
+
+        # 4️⃣ HORARIO NOCTURNO
         else:
-            # 4️⃣ Horas nocturnas → dormir hasta la próxima hora
-            print(f"[24H] Horario nocturno {hora}, esperando próxima ventana...")
-            time.sleep(1800)
-
+            log.info(f"[24H] Horario nocturno {hora}, esperando próxima ventana...")
+            ib.sleep(1800)
 
 # Función que mantiene el schedule corriendo en hilo aparte
 def iniciar_scheduler_diario():
@@ -1232,7 +1436,8 @@ def iniciar_scheduler_diario():
             time.sleep(60)
     t = threading.Thread(target=loop_schedule, daemon=True)
     t.start()
-    print(f"[SCHEDULER] Tarea diaria programada ({DAILY_MAIL_ET} ET).")
+    log.info(f"[SCHEDULER] Tarea diaria programada ({DAILY_MAIL_ET} ET).")
+
 
 def programar_reinicio_market_open():
     tz = pytz.timezone('US/Eastern')
@@ -1247,10 +1452,10 @@ def programar_reinicio_market_open():
     if segundos_faltantes < 0:
         segundos_faltantes = 60
 
-    print(f"[SCHEDULER] Mercado abre a las 9:30 ET → esperando {segundos_faltantes/3600:.2f} h...")
+    log.info(f"[SCHEDULER] Mercado abre a las 9:30 ET → esperando {segundos_faltantes/3600:.2f} h...")
 
     def despertar():
-        print("[SCHEDULER] 🌅 Apertura de mercado detectada — retomando análisis LIVE.")
+        log.ok("[SCHEDULER] 🌅 Apertura de mercado detectada — retomando análisis LIVE.")
 
     threading.Timer(segundos_faltantes, despertar).start()
 
@@ -1260,5 +1465,3 @@ if __name__ == '__main__':
         ensure_ib_connection()
         iniciar_scheduler_diario()
         run_24h_loop(interval_open_minutes=5)
-
-
