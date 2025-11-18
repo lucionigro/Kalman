@@ -47,11 +47,11 @@ class Config:
     ]
     
     # Parámetros de estrategia (empezamos con los agresivos del código original)
-    PRICE_SOURCE = "hl2"          # (H + L) / 2
-    MEASUREMENT_NOISE = 0.25      # Kalman sensibilidad
-    PROCESS_NOISE = 0.07          # Kalman adaptación
-    ATR_PERIOD = 10                # ATR periodo (muy agresivo)
-    ATR_FACTOR = 2.0              # Multiplicador Supertrend (muy ajustado)
+    PRICE_SOURCE = "hl2"          
+    MEASUREMENT_NOISE = 0.25      #0.25
+    PROCESS_NOISE = 0.07          #0.07
+    ATR_PERIOD = 10                #10
+    ATR_FACTOR = 2.0              #2.0
     
     # Risk Management
     MAX_OPEN_TRADES = 5

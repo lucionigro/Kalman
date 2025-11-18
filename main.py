@@ -139,11 +139,11 @@ TIMEFRAME          = '1 day'    # swing diario
 # ===================== RANKING / RS =====================
 RS_BENCHMARK       = 'SPY'
 RS_LOOKBACK_BARS   = 20
-RS_MIN             = 0.03       # gating mínimo de RS (> 7% vs SPY)
+RS_MIN             = 0.05       # gating mínimo de RS (> 7% vs SPY)
 
 # ===================== RIESGO / EJECUCIÓN =====================
 MAX_OPEN_TRADES     = 4
-BUDGET_PER_TRADE    = 300.0      # para LIVE sizing por cash (fallback a BP)
+BUDGET_PER_TRADE    = 600.0      # para LIVE sizing por cash (fallback a BP)
 RESERVE_CASH_PCT    = 0.00
 USE_BUYING_POWER    = False
 BP_TRADE_CAP        = 1800.0
@@ -169,12 +169,12 @@ EARNINGS_FILTER_ENABLED = False
 EARNINGS_DAYS_WINDOW   = 3       # excluir ±3 días de earnings
 
 REQUIRE_MARKET_UPTREND = True    # filtra entradas long si mercado bajista
-SMA_UPTREND_LEN        = 50
+SMA_UPTREND_LEN        = 200
 
 # ===================== CACHE =====================
 CACHE_DIR = 'data_cache'
 ENABLE_PREFETCH = True
-PACING_SECONDS = 0.8
+PACING_SECONDS = 0.6
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # ===================== DB =====================
@@ -511,10 +511,10 @@ def _rs20_score(df_sym: pd.DataFrame, df_bench: pd.DataFrame | None) -> float:
         return -1e9
 
 def rank_candidates_rs20(symbols: list[str], timeframe: str) -> list[str]:
-    bench = fetch_history(RS_BENCHMARK, '2 M', timeframe, True, use_cache=True) if RS_BENCHMARK else None
+    bench = fetch_history(RS_BENCHMARK, '3 M', timeframe, True, use_cache=True) if RS_BENCHMARK else None
     scored = []
     for i, sym in enumerate(symbols, 1):
-        df = fetch_history(sym, '2 M', TIMEFRAME, True, use_cache=True, refresh_cache=(not IS_LIVE)) 
+        df = fetch_history(sym, '3 M', TIMEFRAME, True, use_cache=True, refresh_cache=(not IS_LIVE)) 
         if df is None or df.empty: continue
         score = _rs20_score(df, bench)
         scored.append((sym, score))
@@ -532,7 +532,7 @@ def avg_dollar_volume_usd(symbol: str, lookback_days: int = 20) -> float:
 
 
 def get_last_close(symbol: str) -> float:
-    df = fetch_history(symbol, '2 M', '1 day', True, use_cache=True)
+    df = fetch_history(symbol, '3 M', '1 day', True, use_cache=True)
     if df is None or df.empty: return 0.0
     return float(df['close'].iloc[-1])
 
@@ -628,27 +628,46 @@ def get_open_symbols_db() -> list[str]:
 
 def close_trade_db(symbol: str, exit_price: float, comentario_extra: str = 'LIVE CLOSE'):
     with db_lock:
-        row = get_open_trade_info(symbol)
+        # Hacer el SELECT directamente acá, sin llamar a get_open_trade_info
+        cur.execute("""
+            SELECT id, cantidad, precio_entrada, fecha_apertura
+            FROM operaciones
+            WHERE ticker=? AND estado='ABIERTA'
+            ORDER BY id DESC
+            LIMIT 1
+        """, (symbol,))
+        row = cur.fetchone()
+
         if not row:
-            log.warn(f"[DB] No ABIERTA para {symbol}"); return
+            log.warn(f"[DB] No ABIERTA para {symbol}")
+            return
+
         op_id, qty, entry_price, fecha_apertura = row
         if qty is None or entry_price is None or fecha_apertura is None:
-            log.warn(f"[DB] Datos incompletos {symbol}"); return
+            log.warn(f"[DB] Datos incompletos {symbol}")
+            return
+
         now_iso = datetime.now(timezone.utc).isoformat()
-        pnl = (float(exit_price or 0.0) - float(entry_price)) * float(qty) - COMMISSION_CLOSE
-        retorno_pct = (float(exit_price or 0.0) / float(entry_price) - 1.0) * 100.0
+        ep = float(entry_price)
+        px = float(exit_price or 0.0)
+
+        pnl = (px - ep) * float(qty) - COMMISSION_CLOSE
+        retorno_pct = (px / ep - 1.0) * 100.0
+
         try:
             dur_h = (pd.to_datetime(now_iso) - pd.to_datetime(fecha_apertura)).total_seconds() / 3600.0
         except Exception:
             dur_h = None
+
         cur.execute("""
             UPDATE operaciones
             SET precio_salida=?, fecha_cierre=?, estado='CERRADA',
                 pnl=?, retorno_pct=?, duracion_horas=?,
                 comentario=COALESCE(comentario,'') || ' | ' || ?
             WHERE id=?
-        """, (exit_price, now_iso, pnl, retorno_pct, dur_h, comentario_extra, op_id))
+        """, (px, now_iso, pnl, retorno_pct, dur_h, comentario_extra, op_id))
         conn.commit()
+
 
 # ===================== CUENTA / SIZING =====================
 def _acct_val(tag: str, currency: str = "USD") -> float:
@@ -806,7 +825,7 @@ def queue_orders_for_next_open():
             else:
                 log.info(f"[PREOPEN] BUY MOO OPG: {sym} x{qty} (via {src}) | rs={rs_val:.4f}")
                 _place_MOO(c, 'BUY', qty)
-            insert_trade_open_db(sym, qty, entry_price=close_px, comentario='PREOPEN OPG queued')
+            insert_trade_open_db(sym, qty, entry_price=None, comentario='PREOPEN OPG queued')
         elif VERBOSE_PREOPEN:
             log.info(f"[PREOPEN][NO-ENTRY] {sym}: sig={sig} dir={direction}")
 
@@ -1016,7 +1035,8 @@ def _should_stop(symbol: str, df: pd.DataFrame, entry_px: float) -> bool:
 
 
 def analyze_symbol_live(symbol):
-    df = fetch_history(symbol, '2 M', TIMEFRAME, True, use_cache=False)
+    df = fetch_history(symbol, '2 M', TIMEFRAME, True, use_cache=True,
+        refresh_cache=False)
     if df is None or df.empty:
         log.warn(f"[LIVE][WARN] Sin datos {symbol}")
         return
@@ -1267,57 +1287,62 @@ def prefetch_universe(symbols: list[str], durationStr: str, barSize: str, useRTH
 
 def enviar_resumen_diario():
     """
-    Envía el resumen diario de posiciones, PnL y rendimiento de la cuenta IBKR.
-    Corrige errores de tipo Series y maneja fallos de conexión SMTP o IBKR.
-    Idempotente por día vía LAST_DAILY_MAIL_DATE.
+    Genera y envía el mail HTML de estado diario usando email_ibkr.py:
+    - obtener_posiciones_ibkr  → posiciones abiertas (IBKR)
+    - obtener_cerradas_db      → operaciones cerradas hoy (DB local)
+    - generar_html             → arma el HTML con la tabla
+    - enviar_mail              → envía el correo
+
+    Usa LAST_DAILY_MAIL_DATE para no mandar más de un mail por día.
     """
     global LAST_DAILY_MAIL_DATE
+
     try:
-        today_str = datetime.now().strftime('%Y-%m-%d')
+        today = datetime.now().date()
+        today_str = today.strftime('%Y-%m-%d')
+
+        # Evitar doble envío
         if LAST_DAILY_MAIL_DATE == today_str:
             log.info("[SCHEDULER] Mail diario ya enviado hoy; se omite.")
             return
 
-        log.info("[SCHEDULER] Enviando resumen diario IBKR...")
+        log.info("[SCHEDULER] Enviando resumen diario IBKR (HTML)...")
 
-        # 🔹 Obtener resumen desde la DB o directamente desde IBKR
-        resumen_df = obtener_posiciones_ibkr()  # <-- usa tu función real
-        if resumen_df is None or resumen_df.empty:
-            log.warn("[SCHEDULER][WARN] Resumen vacío, no se envía mail.")
+        # 1️⃣ Posiciones abiertas desde IBKR (mismo puerto/cuenta que el bot)
+        try:
+            df_abiertas = obtener_posiciones_ibkr(
+                port=IB_PORT,
+                client_id=IB_CLIENT_ID,
+                account_id=ACCOUNT_ID
+            )
+        except Exception as e:
+            log.err(f"[SCHEDULER][MAIL] Error en obtener_posiciones_ibkr: {e}")
             return
 
-        # 🔧 Fix: si es Series, convertir a DataFrame (evita 'Series' object has no attribute retorno_pct)
-        if isinstance(resumen_df, pd.Series):
-            resumen_df = resumen_df.to_frame().T
+        if df_abiertas is None or df_abiertas.empty:
+            log.warn("[SCHEDULER][MAIL] obtener_posiciones_ibkr devolvió vacío; no se envía mail.")
+            return
 
-        def safe_val(df, col, default=0.0):
-            try:
-                return float(df[col].iloc[0])
-            except Exception:
-                return default
+        # 2️⃣ Operaciones cerradas del día desde la DB local
+        try:
+            df_cerradas = obtener_cerradas_db()
+        except Exception as e:
+            log.err(f"[SCHEDULER][MAIL] Error en obtener_cerradas_db: {e}")
+            df_cerradas = pd.DataFrame()
 
-        # 🔹 Campos seguros
-        retorno_pct = safe_val(resumen_df, "retorno_pct")
-        ganadores = safe_val(resumen_df, "ganadores")
-        perdedores = safe_val(resumen_df, "perdedores")
-        profit_factor = safe_val(resumen_df, "profit_factor")
+        # 3️⃣ Generar HTML con el mismo formato del reporte viejo
+        html_body = generar_html(df_abiertas, df_cerradas)
 
-        # 🔹 Crear cuerpo del mail
-        subject = f"📊 Estado diario IBKR ({today_str})"
-        body = (
-            f"📈 Retorno diario: {retorno_pct:.2f}%\n"
-            f"✅ Ganadores: {int(ganadores)} | ❌ Perdedores: {int(perdedores)}\n"
-            f"💰 Profit Factor: {profit_factor:.2f}\n\n"
-            "Resumen completo guardado en la base local."
-        )
+        subject = f"📊 Estado diario con IBKR ({today_str})"
+        enviar_mail(subject, html_body)
 
-        # 🔹 Enviar mail (usa tu función actual)
-        enviar_mail(subject, body)
         LAST_DAILY_MAIL_DATE = today_str
-        log.ok("✅ Mail enviado: resumen diario IBKR")
+        log.ok("✅ Mail enviado: Estado diario con IBKR")
 
     except Exception as e:
         log.err(f"[SCHEDULER][MAIL][ERROR] {e}")
+
+
 
 
 
@@ -1344,7 +1369,7 @@ def run_24h_loop(interval_open_minutes=10):
             log.iter_hdr(iter_n, "PREOPEN", extra=f"({hoy})")
             try:
                 ensure_ib_connection()
-                prefetch_universe(SYMBOLS, '2 M', TIMEFRAME, True)
+                prefetch_universe(SYMBOLS, '3 M', TIMEFRAME, True)
                 queue_orders_for_next_open()
                 preopen_done = hoy
             except Exception as e:
@@ -1419,7 +1444,7 @@ def run_24h_loop(interval_open_minutes=10):
 
                 ib.sleep(3600)
 
-        # 4️⃣ HORARIO NOCTURNO
+        # 4️⃣ |
         else:
             log.info(f"[24H] Horario nocturno {hora}, esperando próxima ventana...")
             ib.sleep(1800)
