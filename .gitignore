@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime/local artifacts
+runs/*
+!runs/.gitkeep
+*.db
+
+# Market data caches are local and can be regenerated.
+data_cache/
+backtest_cache/

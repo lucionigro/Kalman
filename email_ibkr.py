@@ -1,4 +1,5 @@
 import smtplib
+import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
@@ -9,11 +10,11 @@ from ib_insync import IB, util
 import pandas as pd
 
 # ==================== CONFIG SMTP ====================
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USER = "lnigrot@gmail.com"
-SMTP_PASS = "opom weph ymrm hpls"   # Clave de app (no tu password normal)
-TO_EMAIL   = "lnigrot@gmail.com"
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+TO_EMAIL = os.environ.get("SMTP_TO", SMTP_USER)
 
 # ==================== CONFIG DB ======================
 DB_FILE = "trades_live.db"
@@ -21,6 +22,8 @@ DB_FILE = "trades_live.db"
 # ==================== FUNCIONES GENERALES ======================
 
 def enviar_mail(asunto: str, cuerpo_html: str):
+    if not SMTP_USER or not SMTP_PASS or not TO_EMAIL:
+        raise RuntimeError("SMTP no configurado. Setear SMTP_USER, SMTP_PASS y SMTP_TO en el entorno.")
     msg = MIMEMultipart("alternative")
     msg["From"] = SMTP_USER
     msg["To"] = TO_EMAIL
@@ -84,12 +87,15 @@ def mail_orden(symbol: str, tipo: str, cantidad: int, precio: float, comentario:
 
 
 
-def obtener_posiciones_ibkr(port=4001, client_id=99, account_id="U22866664"):
+def obtener_posiciones_ibkr(port=None, client_id=None, account_id=None):
     """
     Trae posiciones actuales y PnL% desde IBKR (usa datos delayed si no hay realtime).
     Se conecta al puerto indicado (por defecto 4001 = LIVE; 7497 = PAPER).
     Filtra por la cuenta IBKR especificada.
     """
+    port = int(port or os.environ.get("KALMAN_IB_PORT", "4001"))
+    client_id = int(client_id or os.environ.get("KALMAN_IB_CLIENT_ID", "99"))
+    account_id = account_id or os.environ.get("KALMAN_ACCOUNT_ID", "")
     util.startLoop()
     ib = IB()
     try:
@@ -104,7 +110,7 @@ def obtener_posiciones_ibkr(port=4001, client_id=99, account_id="U22866664"):
     try:
         for p in ib.positions():
             # 🔹 Filtrar sólo posiciones de la cuenta activa
-            if getattr(p, "account", None) != account_id:
+            if account_id and getattr(p, "account", None) != account_id:
                 continue
 
             sym = p.contract.symbol

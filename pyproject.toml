@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kalman-quant"
+version = "0.1.0"
+description = "Kalman Hull Supertrend quant research, dry-run/paper execution, and terminal UI."
+requires-python = ">=3.9"
+dependencies = [
+  "ib-insync>=0.9.86",
+  "matplotlib>=3.7",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "pyyaml>=6.0",
+  "rich>=13.7",
+  "schedule>=1.2",
+  "seaborn>=0.13",
+  "textual>=0.58",
+  "pytz>=2024.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+kalman-quant = "kalman_quant.cli:main"
+kalman-terminal = "kalman_quant.ui.terminal:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kalman_quant*"]

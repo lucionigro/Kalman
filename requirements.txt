@@ -1,0 +1,10 @@
+ib-insync>=0.9.86
+matplotlib>=3.7
+numpy>=1.24
+pandas>=2.0
+pyyaml>=6.0
+rich>=13.7
+schedule>=1.2
+seaborn>=0.13
+textual>=0.58
+pytz>=2024.1

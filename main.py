@@ -50,9 +50,9 @@ MODE_N = MODE.strip().upper()
 IS_BACKTEST = (MODE_N == "BACKTEST")
 IS_LIVE = (MODE_N == "LIVE")
 
-IB_PORT = 4001  # 7497 DEMO
-IB_CLIENT_ID = 1
-ACCOUNT_ID = "U22866664"
+IB_PORT = int(os.environ.get("KALMAN_IB_PORT", "4001"))  # 7497 DEMO/PAPER
+IB_CLIENT_ID = int(os.environ.get("KALMAN_IB_CLIENT_ID", "1"))
+ACCOUNT_ID = os.environ.get("KALMAN_ACCOUNT_ID", "")
 EXCHANGE = 'SMART'
 CURRENCY = 'USD'
 # Universo (puede reducirse para pruebas y calentar cache más rápido)

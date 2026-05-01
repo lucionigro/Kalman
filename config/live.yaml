@@ -1,0 +1,57 @@
+profile: live
+mode: live
+enabled: false
+blocked_reason: "Live real queda bloqueado hasta completar backtest, dry-run y paper con reportes consistentes."
+db_path: trades_live.db
+runs_dir: runs
+data_cache_dir: data_cache
+backtest_cache_dir: backtest_cache
+ibkr:
+  host: 127.0.0.1
+  port: 4001
+  client_id: 51
+  account_id: ""
+  market_data_type: 3
+strategy:
+  price_source: hl2
+  measurement_noise: 0.25
+  process_noise: 0.07
+  atr_period: 10
+  atr_factor: 2.0
+  timeframe: 1 day
+  rs_benchmark: SPY
+  rs_lookback_bars: 20
+  rs_min: 0.05
+  score_entry_min: 0.35
+risk:
+  initial_capital: 100000
+  max_open_trades: 4
+  budget_per_trade: 600
+  reserve_cash_pct: 0
+  use_buying_power: false
+  bp_trade_cap: 1800
+  bp_reserve_pct: 0.10
+  max_loss_pct: 0.05
+  stop_atr_mult: 2.5
+  apply_atr_trail: false
+  kill_switch_dd_pct: 0.05
+  max_drawdown_pct: 0.15
+  reduce_drawdown_pct: 0.10
+  target_volatility_pct: 12
+  max_exposure_pct: 0.80
+  max_single_name_pct: 0.08
+  max_daily_loss_pct: 0.03
+  max_weekly_loss_pct: 0.06
+  max_correlated_positions: 2
+  min_price: 5
+  adv_min_usd: 25000000
+  require_market_uptrend: true
+  sma_uptrend_len: 200
+execution:
+  commission_open: 1
+  commission_close: 1
+  slippage_per_share: 0.02
+  slippage_pct: 0.0005
+  fill_price: next_open
+universe:
+  symbols: [NVDA, AMD, AAPL, MSFT, META, GOOG, AMZN, MELI, YPF, SPY]

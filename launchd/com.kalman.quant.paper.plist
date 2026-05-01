@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kalman.quant.paper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>zsh</string>
+    <string>-lc</string>
+    <string>cd /Users/lucionigro/Repository/Kalman &amp;&amp; KALMAN_CONFIG=config/paper.yaml python3 -m kalman_quant.cli paper-daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/tmp/kalman-paper.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/kalman-paper.err.log</string>
+</dict>
+</plist>

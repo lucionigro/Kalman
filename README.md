@@ -2,6 +2,161 @@
 
 Bot de trading automático desarrollado en **Python** sobre la API de **Interactive Brokers (IBKR)** utilizando `ib_insync`.
 
+> Estado nuevo: el repo ahora incluye un paquete `kalman_quant` para research reproducible, dry-run auditable, ejecución paper por capas y una terminal local estilo Bloomberg. El bot legacy (`main.py`) queda disponible, pero la ruta recomendada para seguir evolucionando es `kalman-quant`.
+
+---
+
+## 🚀 Nuevo flujo quant recomendado
+
+### 1. Instalar dependencias
+
+```bash
+python3 -m pip install -e .
+```
+
+### 2. Configurar entorno
+
+```bash
+cp .env.example .env
+```
+
+Editar `.env` con:
+
+- `KALMAN_ACCOUNT_ID`: cuenta paper/demo de IBKR.
+- `KALMAN_IB_PORT`: `7497` para TWS Paper o el puerto paper que uses en IB Gateway.
+- `SMTP_USER`, `SMTP_PASS`, `SMTP_TO`: solo si querés mails.
+
+### 3. Backtest reproducible
+
+```bash
+KALMAN_CONFIG=config/research.yaml kalman-quant backtest
+```
+
+Cada corrida se guarda en `runs/YYYY-MM-DD_HHMMSS/` con:
+
+- `config.json`
+- `trades.csv`
+- `equity.csv`
+- `summary.json`
+
+### 4. Walk-forward
+
+```bash
+KALMAN_CONFIG=config/research.yaml kalman-quant walk-forward
+```
+
+Esto genera folds train/test para validar la estrategia fuera de muestra.
+
+### 5. Dry-run auditable
+
+```bash
+KALMAN_CONFIG=config/dry_run.yaml kalman-quant dry-run
+```
+
+En este modo se registran `OrderIntent` y eventos en SQLite, pero **no se llama a IBKR ni se envían órdenes**.
+
+### 6. Terminal estilo Bloomberg
+
+```bash
+KALMAN_CONFIG=config/dry_run.yaml kalman-terminal
+```
+
+La terminal muestra snapshots, señales, órdenes/intents, riesgo y últimas corridas. La UI solo observa datos y no decide trades.
+
+### 7. Paper trading
+
+El perfil `config/paper.yaml` está preparado para IBKR Paper. La política recomendada es:
+
+1. Ejecutar al menos 5 ruedas en `dry_run`.
+2. Revisar `runs/`, SQLite y terminal.
+3. Recién después conectar broker paper con tamaño mínimo.
+
+El perfil `live` real queda bloqueado por defecto en `config/live.yaml`.
+
+---
+
+## 🧪 Kalman Quant V2: research lab + paper automático
+
+### Data sync IBKR
+
+```bash
+KALMAN_CONFIG=config/research.yaml python3 -m kalman_quant.cli data-sync --duration "3 Y"
+```
+
+Descarga diario RTH desde IBKR a cache CSV versionable por duración. Respeta pacing básico entre símbolos.
+
+### Universo líquido + data quality
+
+```bash
+KALMAN_CONFIG=config/research.yaml python3 -m kalman_quant.cli universe-refresh
+```
+
+Genera `UniverseSnapshot` para `top_us_liquid` y eventos `DataQualityReport` en SQLite. La UI muestra tickers aceptados, rechazos y problemas de datos.
+
+### Research grid champion/challenger
+
+```bash
+KALMAN_CONFIG=config/research.yaml python3 -m kalman_quant.cli research-grid
+```
+
+Ejecuta combinaciones controladas de parámetros y guarda resultados en `runs/research_grid/grid_results.csv`.
+
+### Promotion gates
+
+```bash
+python3 -m kalman_quant.cli --config config/research.yaml promote-strategy runs/<run_id>
+```
+
+Genera `promotion_report.md`. Una estrategia no debería pasar a paper si no supera Sharpe positivo, drawdown, profit factor y cantidad mínima de trades.
+
+### Health check
+
+```bash
+KALMAN_CONFIG=config/dry_run.yaml python3 -m kalman_quant.cli health
+```
+
+Detecta estado de DB, runs, cuenta IBKR vacía, live bloqueado y carga de datos.
+
+### Paper daemon
+
+```bash
+KALMAN_CONFIG=config/paper.yaml python3 -m kalman_quant.cli paper-daemon --once
+KALMAN_CONFIG=config/paper.yaml python3 -m kalman_quant.cli paper-daemon
+```
+
+`paper-daemon` corre solo en días hábiles entre 08:45 y 16:05 ET. Usa scoring multifactor, risk state y `DecisionRecord` antes de enviar una orden paper.
+
+Template launchd:
+
+```bash
+cp launchd/com.kalman.quant.paper.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.kalman.quant.paper.plist
+launchctl print gui/$(id -u)/com.kalman.quant.paper
+```
+
+### Señal V2
+
+La entrada ya no depende solo de `signal == 1`. Ahora se calcula `StrategySignal` con:
+
+- Kalman Hull Supertrend.
+- RS 20/60/120.
+- Breakout.
+- Compresión de volatilidad.
+- Distancia a SMA.
+- Breadth de mercado.
+- Régimen de mercado.
+
+### Riesgo V2
+
+El portfolio engine agrega:
+
+- Sizing por volatilidad objetivo.
+- Estados `normal`, `reduced`, `risk_off`, `halted`.
+- Drawdown objetivo 10-15%.
+- Límites de exposición, pérdida diaria/semanal y single-name.
+
+La cuenta real sigue bloqueada hasta que los reportes de backtest, dry-run y paper sean consistentes.
+
 Implementa una estrategia de **swing trading cuantitativo** basada en el indicador **Kalman Hull Supertrend**, con control completo de riesgo, gestión de capital y sincronización en tiempo real con la cuenta de IBKR.
 
 ---
